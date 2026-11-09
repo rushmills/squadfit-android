@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SquadFit</string>
+    <string name="title_activity_main">SquadFit</string>
+    <string name="package_name">app.squadfit.girlies</string>
+    <string name="custom_url_scheme">app.squadfit.girlies</string>
+    <string name="health_connect_privacy_policy_url">https://squadfitgirlies.netlify.app/privacy.html</string>
+</resources>

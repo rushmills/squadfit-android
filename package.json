@@ -1,0 +1,13 @@
+{
+  "name": "squadfit-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SquadFit Android app: wraps squadfitgirlies.netlify.app and syncs steps from Health Connect",
+  "scripts": { "sync": "cap sync android" },
+  "dependencies": {
+    "@capacitor/android": "8.6.0",
+    "@capacitor/core": "8.6.0",
+    "@capgo/capacitor-health": "8.12.1"
+  },
+  "devDependencies": { "@capacitor/cli": "8.6.0" }
+}

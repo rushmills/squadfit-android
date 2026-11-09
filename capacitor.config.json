@@ -1,0 +1,11 @@
+{
+  "appId": "app.squadfit.girlies",
+  "appName": "SquadFit",
+  "webDir": "www",
+  "server": {
+    "url": "https://squadfitgirlies.netlify.app",
+    "androidScheme": "https",
+    "cleartext": false
+  },
+  "android": { "backgroundColor": "#120a1c" }
+}
