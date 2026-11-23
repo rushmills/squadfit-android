@@ -48,7 +48,17 @@ public class StepChipPlugin extends Plugin {
         r.put("lifetime", StepStore.lifetime(c));
         r.put("today", StepStore.todaySteps(c));
         r.put("lastAt", StepStore.prefs(c).getLong("lastAt", 0));
+        r.put("error", StepStore.prefs(c).getString("err", ""));
+        android.os.PowerManager pm = (android.os.PowerManager) c.getSystemService(Context.POWER_SERVICE);
+        r.put("batteryOk", pm == null || pm.isIgnoringBatteryOptimizations(c.getPackageName()));
+        r.put("svcStart", StepStore.prefs(c).getLong("svcStart", 0));
         try { r.put("days", new JSObject(StepStore.daysJson(c))); } catch (Exception e) { r.put("days", new JSObject()); }
+        try {
+            JSObject m = new JSObject();
+            m.put(StepStore.today(), new JSObject(StepStore.minutesJson(c, StepStore.today())));
+            m.put(StepStore.yesterday(), new JSObject(StepStore.minutesJson(c, StepStore.yesterday())));
+            r.put("minutes", m);
+        } catch (Exception e) { r.put("minutes", new JSObject()); }
         return r;
     }
 
@@ -56,7 +66,8 @@ public class StepChipPlugin extends Plugin {
         Context c = getContext();
         StepStore.setEnabled(c, true);
         if (!StepService.running) {
-            try { ContextCompat.startForegroundService(c, new Intent(c, StepService.class)); } catch (Exception ignored) { }
+            try { ContextCompat.startForegroundService(c, new Intent(c, StepService.class)); }
+            catch (Exception e) { StepStore.prefs(c).edit().putString("err", String.valueOf(e)).apply(); }
         }
     }
 
@@ -78,6 +89,20 @@ public class StepChipPlugin extends Plugin {
     @PermissionCallback
     private void afterPermission(PluginCall call) {
         if (hasPermission(getContext())) startCounting();
+        call.resolve(state());
+    }
+
+    /** Ask the phone not to put SquadFit to sleep (Samsung does this to apps), so counting never stops. */
+    @PluginMethod
+    public void askBattery(PluginCall call) {
+        try {
+            Intent i = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            i.setData(android.net.Uri.parse("package:" + getContext().getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+        } catch (Exception e) {
+            try { Intent i = new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS); i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); getContext().startActivity(i); } catch (Exception ignored) { }
+        }
         call.resolve(state());
     }
 

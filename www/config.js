@@ -20,6 +20,9 @@ window.SQUADFIT_CONFIG = {
   // Names shown in the Register drop-down (Squad A)
   squadNames: ["Jill", "Rush", "Toni", "Tiffy"],
 
+  // Two separate squads (Side A / Side B) with invite codes. false = one squad, no codes.
+  squadsEnabled: false,
+
   // Each squad's register names and login background. Squad B gets its own group picture
   // once it's added (until then a plain purple background, so Squad A's photo never shows there).
   squads: {

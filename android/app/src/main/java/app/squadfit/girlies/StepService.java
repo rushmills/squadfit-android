@@ -36,14 +36,17 @@ public class StepService extends Service implements SensorEventListener {
             ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(StepStore.todaySteps(this)),
                 Build.VERSION.SDK_INT >= 34 ? ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH : 0);
         } catch (Exception e) {
+            StepStore.prefs(this).edit().putString("err", String.valueOf(e)).apply();   // shown in the app's Me tab
             running = false;
             stopSelf();
             return;
         }
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         Sensor chip = sensors == null ? null : sensors.getDefaultSensor(Sensor.TYPE_STEP_COUNTER);
-        if (chip != null) sensors.registerListener(this, chip, SensorManager.SENSOR_DELAY_NORMAL, 1_000_000);
-        else stopSelf();
+        if (chip != null) {
+            sensors.registerListener(this, chip, SensorManager.SENSOR_DELAY_NORMAL, 1_000_000);
+            StepStore.prefs(this).edit().remove("err").putLong("svcStart", System.currentTimeMillis()).apply();
+        } else { StepStore.prefs(this).edit().putString("err", "No step chip on this phone").apply(); stopSelf(); }
     }
 
     @Override

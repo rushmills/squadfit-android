@@ -4,7 +4,7 @@ import { ic, tile } from './icons.js';
 import { createStepCounter } from './steps.js';
 
 // ============ Version check: phones always get the newest app ============
-const APP_VERSION = '202611180900';
+const APP_VERSION = '202611231000';
 async function checkForUpdate() {
   try {
     const r = await fetch('version.txt?t=' + Date.now(), { cache: 'no-store' });
@@ -193,32 +193,64 @@ const nativeHealth = () => {
   if (typeof C.nativePromise !== 'function') return null;
   return healthProxy ||= new Proxy({}, { get: (_, m) => (m === 'then' || typeof m !== 'string') ? undefined : (o) => C.nativePromise('Health', m, o || {}) });
 };
+// ---- Android app: the phone's own step chip (counts all day, even locked; ignores most car bumps) ----
+const pluginProxies = {};
+const nativePlugin = (name) => {
+  const C = window.Capacitor;
+  if (!C?.isNativePlatform?.()) return null;
+  if (C.Plugins?.[name]) return C.Plugins[name];
+  if (typeof C.nativePromise !== 'function') return null;
+  return pluginProxies[name] ||= new Proxy({}, { get: (_, m) => (m === 'then' || typeof m !== 'string') ? undefined : (o) => C.nativePromise(name, m, o || {}) });
+};
+let chipState = null;   // { available, permission, running, lifetime, today, days } or null (web / older app)
+async function chipStatus() {
+  const C = nativePlugin('StepChip'); if (!C) return (chipState = null);
+  try { return (chipState = await C.status()); } catch { return (chipState = null); }   // app installed before the chip update
+}
+async function ensureChip() {
+  const st = await chipStatus();
+  if (!st?.available || st.running) return st;
+  try { chipState = await nativePlugin('StepChip').start(); } catch { }
+  return chipState;
+}
+const chipOn = () => !!(chipState?.available && chipState.permission && chipState.running);
+
 let lastHealthSync = 0;
+// Today's (and this week's) phone steps: the step chip and Health Connect (Samsung Health / watch), whichever is higher each day
 async function syncHealthConnect(force) {
-  const H = nativeHealth(); if (!H || !me) return;
+  if (!me) return;
   if (!force && Date.now() - lastHealthSync < 60000) return;
   lastHealthSync = Date.now();
+  const perDay = {}, dist = {};
+  const st = await ensureChip();
+  if (st?.days) for (const [d, v] of Object.entries(st.days)) perDay[d] = Math.max(perDay[d] || 0, Math.round(v || 0));
+  const H = nativeHealth();
+  if (H) {
+    try {
+      const av = await H.isAvailable();
+      if (av?.available) {
+        await H.requestAuthorization({ read: ['steps', 'distance'] });
+        const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - 6);
+        const range = { startDate: start.toISOString(), endDate: new Date().toISOString(), bucket: 'day', aggregation: 'sum' };
+        const { samples = [] } = await H.queryAggregated({ dataType: 'steps', ...range });
+        for (const sm of samples) { const d = ymd(new Date(sm.startDate)); perDay[d] = Math.max(perDay[d] || 0, Math.round(sm.value || 0)); }
+        try { for (const sm of (await H.queryAggregated({ dataType: 'distance', ...range })).samples || []) dist[ymd(new Date(sm.startDate))] = sm.value; } catch { }
+      } else if (force && !chipOn()) toast('Health Connect isn\'t set up on this phone yet. See Me > Phone steps.');
+    } catch (e) { console.warn('Health Connect', e); if (force && !chipOn()) toast('Couldn\'t read Health Connect. Check permissions in Me > Phone steps.'); }
+  }
   try {
-    const av = await H.isAvailable();
-    if (!av?.available) { if (force) toast('Health Connect isn\'t set up on this phone yet. See Me > Phone steps.'); return; }
-    await H.requestAuthorization({ read: ['steps', 'distance'] });
-    const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - 6);
-    const range = { startDate: start.toISOString(), endDate: new Date().toISOString(), bucket: 'day', aggregation: 'sum' };
-    const { samples = [] } = await H.queryAggregated({ dataType: 'steps', ...range });
-    let dist = []; try { dist = (await H.queryAggregated({ dataType: 'distance', ...range })).samples || []; } catch { }
-    let changed = 0, todaySteps = 0;
-    for (const sm of samples) {
-      const day = ymd(new Date(sm.startDate)), steps = Math.round(sm.value || 0);
-      if (!steps) continue;
-      const m = dist.find(d => ymd(new Date(d.startDate)) === day)?.value;
-      if (await savePhoneSteps(day, steps, m)) changed++;
-      if (day === today()) todaySteps = steps;
+    const weekAgo = addDays(today(), -6);
+    let changed = 0;
+    for (const [day, steps] of Object.entries(perDay)) {
+      if (!steps || day < weekAgo || day > today()) continue;
+      if (await savePhoneSteps(day, steps, dist[day])) changed++;
     }
-    try { localStorage.setItem('squadfit-health-last', String(Date.now())); } catch { }
-    if (changed && todaySteps) toast(`Phone steps today: ${fmtInt(todaySteps)}`);
-    if (changed && document.querySelector('nav.tabs')) render();
-  } catch (e) { console.warn('Health Connect', e); if (force) toast('Couldn\'t read Health Connect. Check permissions in Me > Phone steps.'); }
+    if (chipOn() || Object.keys(perDay).length) { try { localStorage.setItem('squadfit-health-last', String(Date.now())); } catch { } }
+    if (changed && document.querySelector('nav.tabs') && !document.querySelector('.sheet')) render();
+  } catch (e) { console.warn('phone steps', e); }
 }
+// Keep today's steps fresh while the app is open, so the squad sees them as they happen
+setInterval(() => { if (document.visibilityState === 'visible' && me) syncHealthConnect(); }, 180000);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncHealthConnect(); });
 
 async function afterLogin() {
@@ -245,11 +277,12 @@ const slugName = (name) => name.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/
 async function renderAuth(mode) {
   const appName = esc(window.SQUADFIT_CONFIG?.appName || 'SquadFit');
   // Which squad is this phone? Nothing about any squad shows until it has that squad's invite code
-  const code = lsGet(SQ_CODE);
-  let sq = null;
+  const one = CFG.squadsEnabled === false;   // one squad: no codes, everyone on the login screen
+  const code = one ? '' : lsGet(SQ_CODE);
+  let sq = one ? { id: 'a' } : null;
   if (code) { try { sq = await api.squadByCode(code); } catch (e) { console.warn(e); sq = lsGet(SQ_ID) ? { id: lsGet(SQ_ID) } : null; } }
-  if (!sq) { lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); return renderSquadCode(code ? 'That squad code isn\'t valid anymore. Ask Rush for the new one.' : ''); }
-  rememberSquad(sq.id, code);
+  if (!sq && !one) { lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); return renderSquadCode(code ? 'That squad code isn\'t valid anymore. Ask Rush for the new one.' : ''); }
+  if (one) lsSet('squadfit-splash', squadBg('a') || 'none'); else rememberSquad(sq.id, code);
   const BG = squadBg(sq.id);
   let members = [];
   try { members = await api.publicMembers(code); } catch (e) { console.warn(e); }
@@ -287,10 +320,10 @@ async function renderAuth(mode) {
         <button class="btn primary block" type="submit">Log in</button>
         <p class="center small muted" style="margin-top:14px"><a href="#" id="forgot-pin" style="color:var(--lav);font-weight:600">Forgot your PIN?</a>${anyLeft ? ` · Don't see your name? <a href="#" id="go-reg" style="color:var(--accent);font-weight:700">Register first</a>` : ''}</p>` : `<div class="empty">No one has registered yet. Tap "Register" to be first.</div>`)}
     </form>
-    <p class="center small muted" style="margin-top:18px"><a href="#" id="other-squad" style="color:var(--muted)">In a different squad? Enter its code</a></p>
+    ${one ? '' : `<p class="center small muted" style="margin-top:18px"><a href="#" id="other-squad" style="color:var(--muted)">In a different squad? Enter its code</a></p>`}
     </div>
   </div>`;
-  $('#other-squad').onclick = (e) => { e.preventDefault(); lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); renderSquadCode(''); };
+  if ($('#other-squad')) $('#other-squad').onclick = (e) => { e.preventDefault(); lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); renderSquadCode(''); };
   $$('.seg button').forEach(b => b.onclick = () => renderAuth(b.dataset.m));
   $('#go-reg') && ($('#go-reg').onclick = (e) => { e.preventDefault(); renderAuth('join'); });
   $('#forgot-pin') && ($('#forgot-pin').onclick = (e) => { e.preventDefault(); openSheet(`<h3>Forgot your PIN?</h3>
@@ -961,7 +994,27 @@ function openLive(opts = {}) {
   document.body.appendChild(root);
   const status = (s) => $('#l-status', root).textContent = s;
   // Steps shown and saved: the higher of the step sensor and the pace math
-  const shown = () => Math.max(L.steps || 0, (L.baseSteps || 0) + (L.extraSteps || 0) + Math.round(L.paceSteps || 0));
+  // Android with the step chip: real steps only (no pace guessing, so a car ride adds nothing). Otherwise: sensor or pace, whichever is higher.
+  const shown = () => L.useChip ? (L.baseSteps || 0) + (L.extraSteps || 0) + (L.chipSteps || 0)
+    : Math.max(L.steps || 0, (L.baseSteps || 0) + (L.extraSteps || 0) + Math.round(L.paceSteps || 0));
+  const CHIP_STILL_MS = 12000;   // no steps from the chip for this long = stopped (or in a car): clock pauses
+  const pollChip = async () => {
+    if (!L.useChip || L.chipBusy) return;
+    L.chipBusy = true;
+    try {
+      const st = await chipStatus();
+      if (st && typeof st.lifetime === 'number') {
+        const d = st.lifetime - (L.chipLast ?? st.lifetime);
+        if (L.running && d > 0 && d < 5000) {
+          L.chipSteps = (L.chipSteps || 0) + d; update();
+          // Moving = at least 4 steps in the last 12 seconds (the odd bump in a car doesn't keep the clock going)
+          const now = Date.now(); const h = (L.chipHist = (L.chipHist || []).filter(x => now - x[0] < CHIP_STILL_MS)); h.push([now, d]);
+          if (h.reduce((a, x) => a + x[1], 0) >= 4) { L.lastChipAt = now; L.lastMoveAt = now; }
+        }
+        L.chipLast = st.lifetime;
+      }
+    } finally { L.chipBusy = false; }
+  };
   const syncPace = () => $$('#l-pacepick button', root).forEach(x => x.classList.toggle('on', x.dataset.p === L.pace));
   const paceMsg = () => { const p = paceOf(L.pace); return p.spm ? `${p.label} pace: at least ${p.spm} steps a minute. It auto-pauses when you stand still.` : 'Pace off: steps come from the step counter only.'; };
   // Continue a saved walk: start from its numbers and update the same entry when you finish
@@ -1073,7 +1126,7 @@ function openLive(opts = {}) {
     const lin = e.acceleration, raw = e.accelerationIncludingGravity;
     const a = (raw && raw.x != null) ? raw : lin;
     if (!a || a.x == null) return;
-    if (!L.motionOk) { L.motionOk = true; $('#l-sensor', root).innerHTML = `${ic('check', 13)} Step sensor: working`; $('#l-sensor', root).style.color = 'var(--move)'; }
+    if (!L.motionOk) { L.motionOk = true; if (!L.useChip) $('#l-sensor', root).innerHTML = `${ic('check', 13)} Step sensor: working`; $('#l-sensor', root).style.color = 'var(--move)'; }
     const m = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
     // Keep the first 3 minutes of motion so the counter can be tuned to real phones
     if (!L.rec) L.rec = [];
@@ -1097,7 +1150,7 @@ function openLive(opts = {}) {
     if (L.steps !== before) { $('#l-steps', root).textContent = fmtInt(shown()); if (L.indoor) update(); }
   };
   const LIVE_KEY = 'squadfit-live-' + me.id;
-  const persist = () => { try { localStorage.setItem(LIVE_KEY, JSON.stringify({ kind: L.kind, elapsed: L.elapsed, meters: L.meters, steps: L.steps, extraSteps: L.extraSteps || 0, extraMi: L.extraMi || 0, contId: L.contId || null, autoCreated: !!L.autoCreated, baseSteps: L.baseSteps || 0, baseMi: L.baseMi || 0, baseMin: L.baseMin || 0, indoor: L.indoor, segs: L.segs || [], pace: L.pace, paceSteps: L.paceSteps || 0, running: !!L.running, minimized: !!bar, hiddenAt: L.hiddenAt || 0, at: Date.now(), day: today() })); } catch { } };
+  const persist = () => { try { localStorage.setItem(LIVE_KEY, JSON.stringify({ kind: L.kind, elapsed: L.elapsed, meters: L.meters, steps: L.steps, extraSteps: L.extraSteps || 0, extraMi: L.extraMi || 0, contId: L.contId || null, autoCreated: !!L.autoCreated, baseSteps: L.baseSteps || 0, baseMi: L.baseMi || 0, baseMin: L.baseMin || 0, indoor: L.indoor, segs: L.segs || [], pace: L.pace, paceSteps: L.paceSteps || 0, useChip: !!L.useChip, chipSteps: L.chipSteps || 0, chipLast: L.chipLast ?? null, running: !!L.running, minimized: !!bar, hiddenAt: L.hiddenAt || 0, at: Date.now(), day: today() })); } catch { } };
   const clearSaved = () => { try { localStorage.removeItem(LIVE_KEY); } catch { } };
   const tick = () => {
     const n = Date.now(); let dt = n - L.lastTick; L.lastTick = n;
@@ -1108,22 +1161,25 @@ function openLive(opts = {}) {
     // Pace steps keep adding while moving, and while the screen is locked (no sensor then, so we trust the pace).
     // They stop when the sensor shows you've been standing still for a few seconds.
     const sensorLive = !L.hiddenAt && document.visibilityState !== 'hidden' && n - (L.lastMotionAt || 0) < 2000;
-    const still = (sensorLive && n - (L.lastMoveAt || 0) > STILL_MS) || !!L.inVehicle;
+    if (L.useChip && L.running && n - (L.lastChipPoll || 0) >= 1500) { L.lastChipPoll = n; pollChip(); }
+    const still = L.useChip ? (n - (L.lastChipAt || 0) > CHIP_STILL_MS || !!L.inVehicle)
+      : ((sensorLive && n - (L.lastMoveAt || 0) > STILL_MS) || !!L.inVehicle);
     // Auto-pause: standing still stops the clock (and so calories), pace steps and miles
     if (!still) L.elapsed += dt;
-    if (L.running && !still) L.paceSteps = (L.paceSteps || 0) + dt / 60000 * paceOf(L.pace).spm;
+    if (L.running && !still && !L.useChip) L.paceSteps = (L.paceSteps || 0) + dt / 60000 * paceOf(L.pace).spm;
     const mv = $('#l-move', root);
     if (mv) mv.textContent = sensorLive ? ` · movement ${(L.sd || 0).toFixed(2)}${still ? ' (still)' : ''}` : (L.running ? ' · no motion data' : '');
     if (L.running && still !== L.wasStill) {
       L.wasStill = still;
       const el = $('#l-sensor', root);
       if (still) {   // take back the few seconds you were already stood still before we noticed
-        const back = Math.min(n - (L.lastMoveAt || n), STILL_MS + 3000);
+        const back = Math.min(n - (L.lastMoveAt || n), (L.useChip ? CHIP_STILL_MS : STILL_MS) + 3000);
         L.paceSteps = Math.max(0, (L.paceSteps || 0) - back / 60000 * paceOf(L.pace).spm);
         L.elapsed = Math.max(0, L.elapsed - back);
         update();
       }
       if (still) { el.innerHTML = L.inVehicle ? `${ic('pause', 13)} In a vehicle: auto-paused` : `${ic('pause', 13)} Not moving: auto-paused`; el.style.color = 'var(--gold, #ffc94d)'; }
+      else if (L.useChip) { el.innerHTML = `${ic('check', 13)} Phone step chip: counting`; el.style.color = 'var(--move)'; }
       else if (L.motionOk) { el.innerHTML = `${ic('check', 13)} Step sensor: working`; el.style.color = 'var(--move)'; }
     }
     update(); persist();
@@ -1143,7 +1199,19 @@ function openLive(opts = {}) {
     const gap = b - a, mins = Math.max(1, Math.round(gap / 60000)), spm = paceOf(L.pace).spm || 100;
     const credit = (ms, steps) => { L.elapsed += ms; L.paceSteps = (L.paceSteps || 0) + steps; update(); persist(); };
     if (L.indoor && !nativeHealth()) { credit(gap, gap / 60000 * paceOf(L.pace).spm); return; }   // treadmill/indoors: no driving
-    const steps = await phoneStepsBetween(a, b);
+    let steps = null;
+    if (L.useChip) {   // the chip kept counting while you were away: exactly the steps you took
+      L.chipBusy = true;
+      try { const st = await chipStatus(); if (st && typeof st.lifetime === 'number') { steps = Math.max(0, st.lifetime - (L.chipLast ?? st.lifetime)); L.chipLast = st.lifetime; L.chipSteps = (L.chipSteps || 0) + steps; if (steps) L.lastChipAt = Date.now(); } } finally { L.chipBusy = false; }
+      if (steps != null) {
+        const ms = Math.min(gap, steps / spm * 60000);
+        L.elapsed += ms; update(); persist();
+        const skipped = Math.round((gap - ms) / 60000);
+        status(skipped >= 2 ? `Welcome back! You took ${fmtInt(steps)} steps while you were away. ${skipped} min had no steps (sitting or driving), so it wasn't counted.` : `Welcome back! You took ${fmtInt(steps)} steps while you were away.`);
+        return;
+      }
+    }
+    if (steps == null) steps = await phoneStepsBetween(a, b);
     if (steps != null) {
       // The phone's own step chip: real steps only. Time counted = how long those steps take at your pace.
       const ms = Math.min(gap, steps / spm * 60000);
@@ -1172,7 +1240,7 @@ function openLive(opts = {}) {
     }
     L.lastTick = Date.now(); L.lastMoveAt = Date.now(); L.mwin = []; L.wasStill = false;   // fresh start for the stand-still check
     const wasHidden = L.hiddenAt; L.hiddenAt = 0; tick(); L.hiddenAt = wasHidden;
-    if (L.hiddenAt && nativeHealth()) { L.hiddenAt = 0; if (await syncWalkFromPhone() && goneMs <= GAP_MS) status('Welcome back! Steps caught up from your phone\'s step counter.'); }
+    if (L.hiddenAt && nativeHealth() && !L.useChip) { L.hiddenAt = 0; if (await syncWalkFromPhone() && goneMs <= GAP_MS) status('Welcome back! Steps caught up from your phone\'s step counter.'); }
     else if (L.hiddenAt) {
       const gone = Date.now() - L.hiddenAt; L.hiddenAt = 0; L.hiddenMs = (L.hiddenMs || 0) + gone;
       if (gone > GAP_MS) { /* handled by the "were you walking?" check */ }
@@ -1191,13 +1259,24 @@ function openLive(opts = {}) {
         if (r !== 'granted') { L.motionWarned = true; status('Step counting needs Motion access. Close and reopen the app, tap Start and choose Allow. Miles and time still count.'); }
       }
       // If the phone sends no motion at all, say so instead of silently showing 0 steps
-      setTimeout(() => { if (L.running && !L.motionOk && !L.motionWarned) { L.motionWarned = true; $('#l-sensor', root).innerHTML = `${ic('x', 13)} Step sensor: not working`; $('#l-sensor', root).style.color = 'var(--danger)'; if (!paceOf(L.pace).spm) status('Your phone isn\'t sending motion to the app. iPhone: Settings > Apps > Safari > Motion & Orientation Access ON, then reopen the app.'); } }, 4000);
+      setTimeout(() => { if (L.running && !L.useChip && !L.motionOk && !L.motionWarned) { L.motionWarned = true; $('#l-sensor', root).innerHTML = `${ic('x', 13)} Step sensor: not working`; $('#l-sensor', root).style.color = 'var(--danger)'; if (!paceOf(L.pace).spm) status('Your phone isn\'t sending motion to the app. iPhone: Settings > Apps > Safari > Motion & Orientation Access ON, then reopen the app.'); } }, 4000);
     }
     L.running = true; L.lastTick = Date.now(); L.lastAuto = Date.now(); L.lastMoveAt = Date.now(); L.wasStill = false; L.mwin = [];
+    // Android app with the step chip: count real steps from it
+    if (!L.reopened || !L.useChip) {
+      const st = await ensureChip();
+      if (chipOn()) {
+        L.useChip = true; L.chipLast = st.lifetime; L.lastChipAt = Date.now();
+        $('#l-sensor', root).innerHTML = `${ic('check', 13)} Phone step chip: counting`; $('#l-sensor', root).style.color = 'var(--move)';
+        const pl = $('.pace-label', root); if (pl) pl.innerHTML = 'Your pace <span class="opt">for calories and Walk/Run</span>';
+      }
+    } else L.lastChipAt = Date.now();
+    if (L.useChip) { $('#l-sensor', root).innerHTML = `${ic('check', 13)} Phone step chip: counting`; $('#l-sensor', root).style.color = 'var(--move)'; }
     L.segs = L.segs || [];   // walking time windows (for the phone's step counter)
     if (!(L.reopened && L.segs.length && L.segs[L.segs.length - 1][1] == null)) L.segs.push([Date.now(), null]);
     L.reopened = false;
-    if (nativeHealth()) status('Counting with your phone\'s step counter, so steps still count if you lock the screen or leave the app.');
+    if (L.useChip) status('Counting real steps from your phone\'s step chip. Lock the screen or leave the app, it keeps counting. Car rides don\'t count.');
+    else if (nativeHealth()) status('Counting with your phone\'s step counter, so steps still count if you lock the screen or leave the app.');
     else status(paceMsg());
     L.timer = setInterval(tick, 1000);
     window.addEventListener('devicemotion', onMotion);
@@ -1266,12 +1345,12 @@ function openLive(opts = {}) {
     const mi = +miles().toFixed(2);
     const est = !L.indoor && mi >= 0.05 ? Math.round(mi / strideMiles(L.kind)) : 0;
     if (!shown() && !est && duration_min < 0.2) { toast('Nothing recorded yet'); return; }
-    const byPace = Math.round(L.paceSteps || 0) > 0 && shown() > (L.steps || 0);
+    const byPace = !L.useChip && Math.round(L.paceSteps || 0) > 0 && shown() > (L.steps || 0);
     const suggested = shown() || est;
     if (L.hiddenAt) { L.hiddenMs = (L.hiddenMs || 0) + (Date.now() - L.hiddenAt); L.hiddenAt = 0; }
     const activeMin = Math.max(0.1, (L.elapsed - (L.hiddenMs || 0)) / 60000), offMin = (L.hiddenMs || 0) / 60000;
     const cadence = Math.min(190, L.steps / activeMin); // steps per minute while counting
-    const missing = !byPace && offMin >= 0.5 && L.steps >= 30 ? Math.round(cadence * offMin) : 0;
+    const missing = !L.useChip && !byPace && offMin >= 0.5 && L.steps >= 30 ? Math.round(cadence * offMin) : 0;
     // Let them check the numbers before saving (e.g. against Apple Health / Google Fit)
     openSheet(`<h3>Save your ${L.kind}</h3>
       <p class="muted small" style="margin-top:0">Check your steps before saving. You can fix them if they look off.</p>
@@ -1321,7 +1400,7 @@ function openLive(opts = {}) {
   try {
     const saved = JSON.parse(localStorage.getItem(LIVE_KEY) || 'null');
     if (!opts.continueAct && saved && saved.day === today() && Date.now() - saved.at < 6 * 3600e3 && saved.elapsed > 5000) {
-      Object.assign(L, { kind: saved.kind, elapsed: saved.elapsed, meters: saved.meters, steps: saved.steps, started: true, extraSteps: saved.extraSteps || 0, extraMi: saved.extraMi || 0, contId: saved.contId || null, autoCreated: !!saved.autoCreated, baseSteps: saved.baseSteps || 0, baseMi: saved.baseMi || 0, baseMin: saved.baseMin || 0, indoor: !!saved.indoor, segs: saved.segs || [], pace: saved.pace || L.pace, paceSteps: saved.paceSteps || 0 });
+      Object.assign(L, { kind: saved.kind, elapsed: saved.elapsed, meters: saved.meters, steps: saved.steps, started: true, extraSteps: saved.extraSteps || 0, extraMi: saved.extraMi || 0, contId: saved.contId || null, autoCreated: !!saved.autoCreated, baseSteps: saved.baseSteps || 0, baseMi: saved.baseMi || 0, baseMin: saved.baseMin || 0, indoor: !!saved.indoor, segs: saved.segs || [], pace: saved.pace || L.pace, paceSteps: saved.paceSteps || 0, useChip: !!saved.useChip, chipSteps: saved.chipSteps || 0, chipLast: saved.chipLast ?? undefined });
       syncWhere(); syncPace();
       L.counter.steps = saved.steps || 0;
       $$('#l-kind button', root).forEach(x => x.classList.toggle('on', x.dataset.k === L.kind));
@@ -1511,6 +1590,13 @@ function renderMe() {
     catch (ex) { e.target.checked = !on; toast(/private_progress|column/i.test(ex.message) ? 'Run the private-progress update in Supabase first' : ex.message); }
   };
   $('#hc-sync') && ($('#hc-sync').onclick = async () => { await syncHealthConnect(true); renderMe(); });
+  $('#chip-on') && ($('#chip-on').onclick = async () => {
+    try { chipState = await nativePlugin('StepChip').start(); } catch { }
+    if (chipOn()) { toast('All-day steps are on 💜'); await syncHealthConnect(true); }
+    else toast('SquadFit needs the Physical activity permission. Phone Settings > Apps > SquadFit > Permissions.');
+    renderMe();
+  });
+  $('#chip-off') && ($('#chip-off').onclick = async () => { try { chipState = await nativePlugin('StepChip').stop(); } catch { } toast('All-day counting is off'); renderMe(); });
   $('#hc-settings') && ($('#hc-settings').onclick = () => nativeHealth()?.openHealthConnectSettings?.().catch(() => toast('Open Health Connect from your phone settings')));
   $('#clear-walks') && ($('#clear-walks').onclick = () => openSheet(`<h3>Clear my data</h3>
     <p class="small" style="margin-top:0">Choose what to delete. Only your own data is affected.</p>
@@ -1561,9 +1647,23 @@ function renderMe() {
 }
 function phoneStepsCard() {
   const isAndroid = /android/i.test(navigator.userAgent), isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  if (chipState?.available) {
+    const on = chipOn();
+    return `<div class="card"><h2>${tile('shoe', 'green')} All-day steps</h2>
+      ${on ? `<div class="notice" style="margin-bottom:10px">✅ SquadFit is counting your steps all day with your phone's step chip, even when the app is closed or the screen is locked. Car rides don't count.</div>
+        <div class="row between" style="margin-bottom:12px"><b>Today</b><b>${fmtInt(chipState.today || 0)} steps</b></div>
+        <p class="muted small" style="margin-top:0">You'll see a quiet "steps today" note in your notifications. That's what keeps it counting.</p>
+        <button class="btn primary block" id="hc-sync">${ic('activity', 16)} Update my steps now</button>
+        <button class="btn ghost block" id="chip-off">Turn off all-day counting</button>`
+      : `<p class="small" style="margin-top:0">Let SquadFit count your steps all day by itself, even when the app is closed. No Start button, no other app needed.</p>
+        ${chipState.permission === false ? `<p class="muted small">When your phone asks, choose <b>Allow</b> for Physical activity (and notifications).</p>` : ''}
+        <button class="btn primary block" id="chip-on">${ic('shoe', 16)} Turn on all-day steps</button>`}
+    </div>`;
+  }
   if (nativeHealth()) {
     let last = 0; try { last = +localStorage.getItem('squadfit-health-last') || 0; } catch { }
     return `<div class="card"><h2>${tile('shoe', 'green')} Phone steps</h2>
+      ${CFG.androidAppUrl ? `<div class="notice" style="margin-bottom:10px">New: SquadFit can now count your steps all day by itself. <a href="${esc(CFG.androidAppUrl)}" style="color:var(--accent);font-weight:700">Update the app</a> to turn it on.</div>` : ''}
       <p class="small" style="margin-top:0">Your all-day steps come from <b>Health Connect</b> (the same count as Samsung Health or Google Fit), even when the app is closed or your phone is in your bag. They sync each time you open the app.</p>
       <div class="muted small" style="margin-bottom:10px">${last ? 'Last synced ' + new Date(last).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'Not synced yet'}</div>
       <button class="btn primary block" id="hc-sync">${ic('activity', 16)} Sync steps now</button>

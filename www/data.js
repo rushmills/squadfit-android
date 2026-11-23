@@ -19,9 +19,12 @@ async function supabaseBackend() {
     async init() { const { data } = await sb.auth.getSession(); user = data.session?.user || null; return user; },
     get userId() { return user?.id; },
     // Squads: a phone only sees a squad's login tiles with that squad's invite code
-    async publicMembers(code) { if (!code) return []; return check(await sb.rpc('public_members', { p_code: code })) || []; },
+    async publicMembers(code) {
+      if (window.SQUADFIT_CONFIG?.squadsEnabled === false) return check(await sb.rpc('public_members')) || [];   // one squad: everyone
+      if (!code) return []; return check(await sb.rpc('public_members', { p_code: code })) || [];
+    },
     async squadByCode(code) { const r = check(await sb.rpc('squad_by_code', { p_code: code })) || []; return r[0] || null; },
-    async mySquads() { const { data, error } = await sb.rpc('my_squads'); return error ? null : data; },
+    async mySquads() { if (window.SQUADFIT_CONFIG?.squadsEnabled === false) return null; const { data, error } = await sb.rpc('my_squads'); return error ? null : data; },
     async squadMembers() { const { data, error } = await sb.from('squad_members').select('squad_id,user_id'); return error ? null : data; },
     async renameSquad(id, name) { check(await sb.rpc('rename_squad', { p_id: id, p_name: name })); },
     async signUp({ username, pin, display_name, color, code }) {
@@ -36,7 +39,9 @@ async function supabaseBackend() {
       } else if (res.error) throw new Error(res.error.message);
       user = res.data.user;
       if (!res.data.session) throw new Error('Email confirmation is still ON in Supabase. Turn it off (see setup guide).');
-      const { error } = await sb.rpc('join_group', { p_username: username, p_display_name: display_name, p_color: color, p_code: code });
+      const args = { p_username: username, p_display_name: display_name, p_color: color };
+        if (window.SQUADFIT_CONFIG?.squadsEnabled !== false) args.p_code = code;
+        const { error } = await sb.rpc('join_group', args);
       if (error) { await sb.auth.signOut(); user = null; throw new Error(error.message); }
     },
     async signIn(username, pin) {
@@ -118,16 +123,17 @@ function demoBackend() {
     async init() { return user; },
     get userId() { return user?.id; },
     async publicMembers(code) {
+      if (window.SQUADFIT_CONFIG?.squadsEnabled === false) return db.profiles.map(({ username, display_name, color, avatar_url }) => ({ username, display_name, color, avatar_url }));
       const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim()); if (!sq) return [];
       return db.profiles.filter(p => db.sm.some(m => m.squad_id === sq.id && m.user_id === p.id)).map(({ username, display_name, color, avatar_url }) => ({ username, display_name, color, avatar_url }));
     },
     async squadByCode(code) { const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim()); return sq ? { id: sq.id, name: sq.name } : null; },
-    async mySquads() { const meP = db.profiles.find(p => p.id === user.id); return db.squads.filter(q => db.sm.some(m => m.squad_id === q.id && m.user_id === user.id)).map(q => ({ ...q, code: meP?.is_admin ? q.code : null })); },
+    async mySquads() { if (window.SQUADFIT_CONFIG?.squadsEnabled === false) return null; const meP = db.profiles.find(p => p.id === user.id); return db.squads.filter(q => db.sm.some(m => m.squad_id === q.id && m.user_id === user.id)).map(q => ({ ...q, code: meP?.is_admin ? q.code : null })); },
     async squadMembers() { const mine = db.sm.filter(m => m.user_id === user.id).map(m => m.squad_id); return db.sm.filter(m => mine.includes(m.squad_id)); },
     async renameSquad(id, name) { db.squads.find(q => q.id === id).name = name; save(); },
     async signUp({ username, pin, display_name, color, code }) {
       const u = username.toLowerCase().trim();
-      const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim());
+      const sq = window.SQUADFIT_CONFIG?.squadsEnabled === false ? db.squads[0] : db.squads.find(x => x.code === (code || '').toLowerCase().trim());
       if (!sq) throw new Error('That squad link or code is not valid. Ask Rush for a new one.');
       if (db.profiles.some(p => p.username === u)) throw new Error('That name is already registered. Tap Log in instead.');
       if (db.sm.filter(m => m.squad_id === sq.id).length >= 4) throw new Error('That squad is full');

@@ -43,6 +43,15 @@ final class StepStore {
                 while (it.hasNext()) { String k = it.next(); if (k.compareTo(cutS) < 0) old.add(k); }
                 for (String k : old) days.remove(k);
                 e.putString("days", days.toString());
+                // Steps per minute (today + yesterday), so the app can tell walking pace without a Start button
+                Calendar now = Calendar.getInstance();
+                String mk = String.valueOf(now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE));
+                JSONObject mins = new JSONObject(p.getString("m_" + d, "{}"));
+                mins.put(mk, mins.optLong(mk, 0) + delta);
+                e.putString("m_" + d, mins.toString());
+                Calendar y = Calendar.getInstance(); y.add(Calendar.DAY_OF_YEAR, -1);
+                String yS = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(y.getTime());
+                for (String k : p.getAll().keySet()) if (k.startsWith("m_") && !k.equals("m_" + d) && !k.equals("m_" + yS)) e.remove(k);
             } catch (Exception ignored) { }
         }
         e.apply();
@@ -53,6 +62,8 @@ final class StepStore {
         try { return new JSONObject(prefs(c).getString("days", "{}")).optLong(today(), 0); } catch (Exception e) { return 0; }
     }
     static String daysJson(Context c) { return prefs(c).getString("days", "{}"); }
+    static String minutesJson(Context c, String day) { return prefs(c).getString("m_" + day, "{}"); }
+    static String yesterday() { Calendar y = Calendar.getInstance(); y.add(Calendar.DAY_OF_YEAR, -1); return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(y.getTime()); }
     static boolean enabled(Context c) { return prefs(c).getBoolean("enabled", false); }
     static void setEnabled(Context c, boolean on) { prefs(c).edit().putBoolean("enabled", on).apply(); }
 }
