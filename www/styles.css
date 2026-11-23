@@ -299,5 +299,29 @@ nav.tabs .plus svg { stroke: #fff !important; }
   .live .lic { display: none; }
 }
 .live .sensor-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px 12px; margin: 4px 0; }
-.live .sensor-row #l-sensor { flex-basis: 100%; text-align: center; }
+.live .sensor-row #l-sensor { white-space: nowrap; }
 .live .sensor-row .btn { white-space: nowrap; }
+/* Pace picker */
+.pace-pick { width: 100%; margin: 6px 0 4px; }
+.pace-pick button { padding: 6px 0; min-width: 0; font-size: 11.5px; }
+.seg.mini.pace-pick { margin-bottom: 12px; }
+.live .seg.mini.pace-pick { margin-bottom: 0; }
+.live .pace-label { text-align: center; margin-top: 12px; }
+.live .seg.mini.pace-pick { margin-top: 4px; }
+/* Back-to-app button + mini walk bar */
+.btn.icon-only { padding: 6px 8px; }
+.livebar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(66px + var(--safe-b)); width: calc(100% - 20px); max-width: 500px; z-index: 30; display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px; border-radius: 16px; background: linear-gradient(135deg, #7b3fe4, #e0399b); box-shadow: 0 8px 24px rgba(0,0,0,.45); color: #fff; }
+.livebar .lb-open { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; background: none; border: 0; color: inherit; font: inherit; text-align: left; padding: 4px 0; cursor: pointer; }
+.livebar .lb-kind { font-size: 12px; opacity: .85; }
+.livebar .lb-time { font-size: 17px; font-variant-numeric: tabular-nums; }
+.livebar .lb-stats { font-size: 12.5px; opacity: .92; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.livebar .lb-dot { width: 9px; height: 9px; border-radius: 50%; background: rgba(255,255,255,.45); flex: none; }
+.livebar .lb-dot.on { background: #6dff9e; animation: lbpulse 1.4s infinite; }
+@keyframes lbpulse { 50% { opacity: .35; } }
+.livebar .lb-btn { flex: none; width: 40px; height: 40px; border-radius: 12px; border: 0; background: rgba(255,255,255,.2); color: #fff; display: grid; place-items: center; cursor: pointer; }
+body.has-livebar .screen { padding-bottom: calc(150px + var(--safe-b)); }
+/* Squads */
+.squad-switch { margin: 0 0 12px; }
+.auth-hero.plain { aspect-ratio: auto; height: 34vh; min-height: 200px; display: grid; place-content: center; justify-items: center; gap: 10px; background: radial-gradient(120% 90% at 30% 20%, #7b3fe4 0%, #c42f8a 55%, var(--bg) 100%); }
+.auth-hero.plain .plain-name { font-size: 26px; font-weight: 800; letter-spacing: .5px; color: #fff; }
+.splash.plain { background: radial-gradient(120% 70% at 30% 25%, #7b3fe4 0%, #c42f8a 50%, var(--bg) 100%); }

@@ -18,8 +18,13 @@ async function supabaseBackend() {
   return {
     async init() { const { data } = await sb.auth.getSession(); user = data.session?.user || null; return user; },
     get userId() { return user?.id; },
-    async publicMembers() { return check(await sb.rpc('public_members')) || []; },
-    async signUp({ username, pin, display_name, color }) {
+    // Squads: a phone only sees a squad's login tiles with that squad's invite code
+    async publicMembers(code) { if (!code) return []; return check(await sb.rpc('public_members', { p_code: code })) || []; },
+    async squadByCode(code) { const r = check(await sb.rpc('squad_by_code', { p_code: code })) || []; return r[0] || null; },
+    async mySquads() { const { data, error } = await sb.rpc('my_squads'); return error ? null : data; },
+    async squadMembers() { const { data, error } = await sb.from('squad_members').select('squad_id,user_id'); return error ? null : data; },
+    async renameSquad(id, name) { check(await sb.rpc('rename_squad', { p_id: id, p_name: name })); },
+    async signUp({ username, pin, display_name, color, code }) {
       let res = await sb.auth.signUp({ email: toEmail(username), password: toPassword(pin) });
       if (res.error && /registered|exists/i.test(res.error.message)) {
         // Only continue if this login exists but never finished joining
@@ -31,7 +36,7 @@ async function supabaseBackend() {
       } else if (res.error) throw new Error(res.error.message);
       user = res.data.user;
       if (!res.data.session) throw new Error('Email confirmation is still ON in Supabase. Turn it off (see setup guide).');
-      const { error } = await sb.rpc('join_group', { p_username: username, p_display_name: display_name, p_color: color });
+      const { error } = await sb.rpc('join_group', { p_username: username, p_display_name: display_name, p_color: color, p_code: code });
       if (error) { await sb.auth.signOut(); user = null; throw new Error(error.message); }
     },
     async signIn(username, pin) {
@@ -56,6 +61,8 @@ async function supabaseBackend() {
       return r;
     },
     async savePrivate(obj) { check(await sb.from('private_stats').upsert({ ...obj, user_id: user.id, updated_at: new Date().toISOString() })); },
+    // Private members: their position only (no numbers). Empty if the database update isn't in yet.
+    async privateRanks(today) { const { data, error } = await sb.rpc('private_ranks', { p_today: today }); return error ? [] : (data || []); },
     async goalProgress() {
       const rows = check(await sb.rpc('goal_progress')) || [];
       return Object.fromEntries(rows.map(r => [r.user_id, r.percent]));
@@ -104,18 +111,29 @@ function demoBackend() {
   let db = load();
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { console.warn(e); } };
   if (!db) { db = seed(); save(); }
+  if (!db.squads) { db.squads = [{ id: 'a', name: 'Squad A', code: 'testa', max_members: 4 }, { id: 'b', name: 'Squad B', code: 'testb', max_members: 4 }]; db.sm = db.profiles.map(p => ({ squad_id: 'a', user_id: p.id })); save(); }
   let user = db.session ? { id: db.session } : null;
 
   return {
     async init() { return user; },
     get userId() { return user?.id; },
-    async publicMembers() { return db.profiles.map(({ username, display_name, color, avatar_url }) => ({ username, display_name, color, avatar_url })); },
-    async signUp({ username, pin, display_name, color }) {
+    async publicMembers(code) {
+      const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim()); if (!sq) return [];
+      return db.profiles.filter(p => db.sm.some(m => m.squad_id === sq.id && m.user_id === p.id)).map(({ username, display_name, color, avatar_url }) => ({ username, display_name, color, avatar_url }));
+    },
+    async squadByCode(code) { const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim()); return sq ? { id: sq.id, name: sq.name } : null; },
+    async mySquads() { const meP = db.profiles.find(p => p.id === user.id); return db.squads.filter(q => db.sm.some(m => m.squad_id === q.id && m.user_id === user.id)).map(q => ({ ...q, code: meP?.is_admin ? q.code : null })); },
+    async squadMembers() { const mine = db.sm.filter(m => m.user_id === user.id).map(m => m.squad_id); return db.sm.filter(m => mine.includes(m.squad_id)); },
+    async renameSquad(id, name) { db.squads.find(q => q.id === id).name = name; save(); },
+    async signUp({ username, pin, display_name, color, code }) {
       const u = username.toLowerCase().trim();
+      const sq = db.squads.find(x => x.code === (code || '').toLowerCase().trim());
+      if (!sq) throw new Error('That squad link or code is not valid. Ask Rush for a new one.');
       if (db.profiles.some(p => p.username === u)) throw new Error('That name is already registered. Tap Log in instead.');
-      if (db.profiles.length >= 4) throw new Error('The group is full');
+      if (db.sm.filter(m => m.squad_id === sq.id).length >= 4) throw new Error('That squad is full');
       const id = uid();
       db.profiles.push({ id, username: u, display_name, color, is_admin: u === 'rush', created_at: new Date().toISOString() });
+      db.sm.push({ squad_id: sq.id, user_id: id }); if (u === 'rush') for (const q of db.squads) if (q.id !== sq.id) db.sm.push({ squad_id: q.id, user_id: id });
       db.pins[u] = pin; db.session = id; user = { id }; save();
     },
     async signIn(username, pin) {
@@ -131,20 +149,34 @@ function demoBackend() {
       db.pins[p.username] = newPin; save();
     },
     async me() { return db.profiles.find(p => p.id === user.id) || null; },
-    async listProfiles() { return [...db.profiles]; },
+    async listProfiles() { const sm = await this.squadMembers(); return db.profiles.filter(p => p.id === user.id || sm.some(m => m.user_id === p.id)); },
     async updateProfile(patch) { Object.assign(db.profiles.find(p => p.id === user.id), patch); save(); },
     async getPrivate() { return db.private[user.id] || null; },
     async savePrivate(obj) { db.private[user.id] = { ...obj, user_id: user.id }; save(); },
     async goalProgress() {
       const out = {};
       for (const [id, s] of Object.entries(db.private)) {
+        if (id !== user.id && db.profiles.find(p => p.id === id)?.private_progress) continue;
         if (s.goal_weight_lb && s.start_weight_lb && s.weight_lb && s.start_weight_lb > s.goal_weight_lb)
           out[id] = Math.max(0, Math.min(100, Math.round((s.start_weight_lb - s.weight_lb) / (s.start_weight_lb - s.goal_weight_lb) * 100)));
       }
       return out;
     },
     async list(table, { userId, from, to } = {}) {
-      return db[table].filter(r => (!userId || r.user_id === userId) && (!from || r.day >= from) && (!to || r.day <= to));
+      const hidden = (u) => u !== user.id && db.profiles.find(p => p.id === u)?.private_progress;   // same rule as the database
+      return db[table].filter(r => !hidden(r.user_id) && (!userId || r.user_id === userId) && (!from || r.day >= from) && (!to || r.day <= to));
+    },
+    async privateRanks(today) {
+      const mine = db.sm.filter(m => m.user_id === user.id).map(m => m.squad_id), out = [];
+      const add = (d, n) => { const x = new Date(d + 'T12:00:00'); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
+      const daySteps = (u, d) => { const rows = db.activities.filter(r => r.user_id === u && r.day === d); const ph = rows.filter(r => r.source === 'phone').reduce((a, r) => a + (+r.steps || 0), 0), ap = rows.filter(r => r.source !== 'phone').reduce((a, r) => a + (+r.steps || 0), 0); return Math.max(ph, ap); };
+      for (const sq of mine) {
+        const mem = db.sm.filter(m => m.squad_id === sq).map(m => m.user_id);
+        const tot = mem.map(u => ({ u, td: daySteps(u, today), wk: Array.from({ length: 7 }, (_, i) => daySteps(u, add(today, -i))).reduce((a, b) => a + b, 0) }));
+        for (const t of tot) if (t.u !== user.id && db.profiles.find(p => p.id === t.u)?.private_progress)
+          out.push({ user_id: t.u, squad_id: sq, today_rank: 1 + tot.filter(o => o.td > t.td).length, week_rank: 1 + tot.filter(o => o.wk > t.wk).length, moved_today: t.td > 0, moved_week: t.wk > 0 });
+      }
+      return out;
     },
     async insert(table, row) { const r = { id: uid(), created_at: new Date().toISOString(), ...row, user_id: user.id }; db[table].push(r); save(); return r; },
     async remove(table, id) { db[table] = db[table].filter(r => !(r.id === id && r.user_id === user.id)); save(); },

@@ -4,7 +4,7 @@ import { ic, tile } from './icons.js';
 import { createStepCounter } from './steps.js';
 
 // ============ Version check: phones always get the newest app ============
-const APP_VERSION = '202611091314';
+const APP_VERSION = '202611180900';
 async function checkForUpdate() {
   try {
     const r = await fetch('version.txt?t=' + Date.now(), { cache: 'no-store' });
@@ -35,12 +35,23 @@ const fmt1 = (n) => (Math.round((n || 0) * 10) / 10).toString();
 const fmtInt = (n) => Math.round(n || 0).toLocaleString();
 const initials = (name) => (name || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const CFG = window.SQUADFIT_CONFIG || {};
-const BG = CFG.backgroundImage || 'assets/squad-bg.jpg';
-const SQUAD_PIC = { id: 'squad', label: 'The Squad', src: BG };
+// ---- Two squads: each phone remembers its squad's invite code; people only ever see their own squad ----
+const SQ_CODE = 'squadfit-squad-code', SQ_ID = 'squadfit-squad-id', SQ_ACTIVE = 'squadfit-active-squad';
+const lsGet = (k) => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
+const lsSet = (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { } };
+const squadCfg = (id) => (CFG.squads || {})[id] || (id === 'a' || !id ? { names: CFG.squadNames || ['Jill', 'Rush', 'Toni', 'Tiffy'], backgroundImage: CFG.backgroundImage || 'assets/squad-bg.jpg' } : { names: [], backgroundImage: '' });
+const squadBg = (id) => squadCfg(id).backgroundImage || '';
+const curBg = () => squadBg(state.squad || lsGet(SQ_ID));
+const rememberSquad = (id, code) => { if (code) lsSet(SQ_CODE, code); if (id) lsSet(SQ_ID, id); lsSet('squadfit-splash', squadBg(id) || 'none'); };
+(() => { try {   // Invite link: ?join=CODE
+  const q = new URLSearchParams(location.search), j = q.get('join');
+  if (j) { lsSet(SQ_CODE, j.trim().toLowerCase()); lsSet(SQ_ID, ''); q.delete('join'); history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q : '')); }
+} catch { } })();
+const SQUAD_PIC = { id: 'squad', label: 'The Squad', get src() { return curBg(); } };
 const MEMBER_PICS = CFG.memberPictures || {};
 // A picture the person uploaded wins; otherwise the squad picture made for them
 const ownPic = (p) => !p ? null : p.avatar_url ? { id: 'own', label: p.display_name, src: p.avatar_url } : MEMBER_PICS[p.username] ? { id: 'own', label: p.display_name, src: MEMBER_PICS[p.username] } : null;
-const picFor = (p) => ownPic(p) || SQUAD_PIC;
+const picFor = (p) => ownPic(p) || (curBg() ? SQUAD_PIC : null);
 const hasOwnPic = (p) => !!ownPic(p);
 const avatar = (p, cls = '') => hasOwnPic(p)
   ? `<div class="avatar img ${cls}" style="background-image:url('${esc(ownPic(p).src)}');box-shadow:0 0 0 2px ${esc(p.color || '#555')}"></div>`
@@ -83,6 +94,34 @@ const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
 
 // ============ State ============
 let api, me, privateStats = null, profiles = [], goals = {};
+let allProfiles = [], mySquads = null, squadMem = null;   // everyone I can see (all my squads) / my squads / who's in which
+// Only show the people in the squad I'm looking at (plus me)
+function applySquad() {
+  if (!mySquads || !squadMem) { profiles = allProfiles; return; }
+  profiles = allProfiles.filter(p => p.id === me.id || squadMem.some(m => m.squad_id === state.squad && m.user_id === p.id));
+  if (!profiles.some(p => p.id === state.viewUser)) state.viewUser = me.id;
+}
+async function loadPeople() {
+  [allProfiles, mySquads, squadMem] = await Promise.all([api.listProfiles(), api.mySquads ? api.mySquads() : null, api.squadMembers ? api.squadMembers() : null]);
+  if (mySquads && !mySquads.length) mySquads = null;
+  if (mySquads) {
+    const ids = mySquads.map(q => q.id);
+    state.squad = [state.squad, lsGet(SQ_ACTIVE), lsGet(SQ_ID)].find(x => x && ids.includes(x)) || ids[0];
+    const q = mySquads.find(x => x.id === state.squad); rememberSquad(q.id, q.code);
+  }
+  applySquad();
+}
+const squadName = (id) => mySquads?.find(q => q.id === id)?.name || '';
+function squadSwitch() {
+  if (!mySquads || mySquads.length < 2) return '';
+  return `<div class="seg squad-switch">${mySquads.map(q => `<button data-sq="${esc(q.id)}" class="${q.id === state.squad ? 'on' : ''}">${esc(q.name)}</button>`).join('')}</div>`;
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest?.('[data-sq]'); if (!b || b.dataset.sq === state.squad) return;
+  state.squad = b.dataset.sq; lsSet(SQ_ACTIVE, state.squad);
+  const q = mySquads.find(x => x.id === state.squad); rememberSquad(q.id, q.code);
+  applySquad(); render();
+});
 const state = { tab: 'today', viewUser: null, calMonth: today().slice(0, 7), foodDay: today(), trackMode: 'move' };
 const byId = (id) => profiles.find(p => p.id === id);
 const isMe = (id) => id === me?.id;
@@ -145,7 +184,15 @@ async function syncPhoneSteps() {
 }
 
 // ---- Android app: read steps from Health Connect (Samsung Health / Google Fit data) ----
-const nativeHealth = () => window.Capacitor?.isNativePlatform?.() ? window.Capacitor?.Plugins?.Health : null;
+// The app loads this site from the web, so the Health plugin isn't pre-registered: call it straight through the native bridge
+let healthProxy = null;
+const nativeHealth = () => {
+  const C = window.Capacitor;
+  if (!C?.isNativePlatform?.()) return null;
+  if (C.Plugins?.Health) return C.Plugins.Health;
+  if (typeof C.nativePromise !== 'function') return null;
+  return healthProxy ||= new Proxy({}, { get: (_, m) => (m === 'then' || typeof m !== 'string') ? undefined : (o) => C.nativePromise('Health', m, o || {}) });
+};
 let lastHealthSync = 0;
 async function syncHealthConnect(force) {
   const H = nativeHealth(); if (!H || !me) return;
@@ -178,10 +225,15 @@ async function afterLogin() {
   try { localStorage.setItem('squadfit-logged-in-before', '1'); } catch { }
   me = await api.me();
   if (!me) { await api.signOut(); renderAuth('join'); throw new Error('Your profile was not finished. Please join again with the same name and PIN.'); }
-  [profiles, privateStats, goals] = await Promise.all([api.listProfiles(), api.getPrivate(), api.goalProgress()]);
   state.viewUser = me.id;
+  [, privateStats, goals] = await Promise.all([loadPeople(), api.getPrivate(), api.goalProgress()]);
   await syncPhoneSteps();
   render();
+  // A walk was running when the phone closed the app: bring it straight back, still running
+  try {
+    const w = JSON.parse(localStorage.getItem('squadfit-live-' + me.id) || 'null');
+    if (w?.running && w.day === today() && Date.now() - w.at < 6 * 3600e3) openLive();
+  } catch { }
 }
 async function refreshGoals() { goals = await api.goalProgress(); }
 
@@ -192,20 +244,27 @@ const cleanPin = (v) => String(v || '').replace(/\D/g, '').slice(0, 4);
 const slugName = (name) => name.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
 async function renderAuth(mode) {
   const appName = esc(window.SQUADFIT_CONFIG?.appName || 'SquadFit');
+  // Which squad is this phone? Nothing about any squad shows until it has that squad's invite code
+  const code = lsGet(SQ_CODE);
+  let sq = null;
+  if (code) { try { sq = await api.squadByCode(code); } catch (e) { console.warn(e); sq = lsGet(SQ_ID) ? { id: lsGet(SQ_ID) } : null; } }
+  if (!sq) { lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); return renderSquadCode(code ? 'That squad code isn\'t valid anymore. Ask Rush for the new one.' : ''); }
+  rememberSquad(sq.id, code);
+  const BG = squadBg(sq.id);
   let members = [];
-  try { members = await api.publicMembers(); } catch (e) { console.warn(e); }
+  try { members = await api.publicMembers(code); } catch (e) { console.warn(e); }
   let seen = false; try { seen = localStorage.getItem('squadfit-logged-in-before') === '1'; } catch { }
-  const SQUAD0 = CFG.squadNames || ['Jill', 'Rush', 'Toni', 'Tiffy'];
+  const SQUAD0 = squadCfg(sq.id).names || [];
   const anyLeft = SQUAD0.some(n => !members.some(m => m.username === slugName(n)));
   // First time on this phone and spots still open: start on Register
   if (!mode) mode = members.length && (seen || !anyLeft) ? 'login' : 'join';
-  const SQUAD = CFG.squadNames || ['Jill', 'Rush', 'Toni', 'Tiffy'];
+  const SQUAD = SQUAD0;
   const taken = new Set(members.map(m => m.username));
   const available = SQUAD.filter(n => !taken.has(slugName(n)));
   const full = members.length >= 4 || !available.length;
   $('#app').innerHTML = `
   <div class="auth">
-    <div class="auth-hero" style="background-image:url('${esc(BG)}')"></div>
+    ${BG ? `<div class="auth-hero" style="background-image:url('${esc(BG)}')"></div>` : `<div class="auth-hero plain"><div class="logo-mark">SF</div><div class="plain-name">${appName}</div></div>`}
     <div class="auth-body">
     ${DEMO ? `<div class="demo-banner">Test mode: everything is saved on this phone only until the database is connected.</div>` : ''}
     <div class="seg"><button data-m="login" class="${mode === 'login' ? 'on' : ''}">Log in</button><button data-m="join" class="${mode === 'join' ? 'on' : ''}">Register</button></div>
@@ -228,8 +287,10 @@ async function renderAuth(mode) {
         <button class="btn primary block" type="submit">Log in</button>
         <p class="center small muted" style="margin-top:14px"><a href="#" id="forgot-pin" style="color:var(--lav);font-weight:600">Forgot your PIN?</a>${anyLeft ? ` · Don't see your name? <a href="#" id="go-reg" style="color:var(--accent);font-weight:700">Register first</a>` : ''}</p>` : `<div class="empty">No one has registered yet. Tap "Register" to be first.</div>`)}
     </form>
+    <p class="center small muted" style="margin-top:18px"><a href="#" id="other-squad" style="color:var(--muted)">In a different squad? Enter its code</a></p>
     </div>
   </div>`;
+  $('#other-squad').onclick = (e) => { e.preventDefault(); lsSet(SQ_CODE, ''); lsSet(SQ_ID, ''); renderSquadCode(''); };
   $$('.seg button').forEach(b => b.onclick = () => renderAuth(b.dataset.m));
   $('#go-reg') && ($('#go-reg').onclick = (e) => { e.preventDefault(); renderAuth('join'); });
   $('#forgot-pin') && ($('#forgot-pin').onclick = (e) => { e.preventDefault(); openSheet(`<h3>Forgot your PIN?</h3>
@@ -259,7 +320,7 @@ async function renderAuth(mode) {
         if (f.pin.length !== 4) throw new Error('Your PIN must be exactly 4 numbers.');
         if (f.pin !== f.pin2) { e.target.pin.value = ''; e.target.pin2.value = ''; e.target.pin.focus(); throw new Error("The two PIN boxes didn't match. Type the same 4 numbers in both."); }
         if (members.some(m => m.username === username)) throw new Error(`${display_name} is already registered. Tap Log in instead.`);
-        await api.signUp({ username, pin: f.pin, display_name, color });
+        await api.signUp({ username, pin: f.pin, display_name, color, code });
         await afterLogin();
         openPrivateSheet(true);
       } else {
@@ -270,6 +331,33 @@ async function renderAuth(mode) {
         await afterLogin();
       }
     } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
+  };
+}
+
+// First screen on a new phone: no squad photos or names until the squad's code is entered (or the invite link was used)
+function renderSquadCode(msg) {
+  const appName = esc(window.SQUADFIT_CONFIG?.appName || 'SquadFit');
+  $('#app').innerHTML = `
+  <div class="auth">
+    <div class="auth-hero plain"><div class="logo-mark">SF</div><div class="plain-name">${appName}</div></div>
+    <div class="auth-body">
+      <h2 style="margin:0 0 6px">Welcome! 💜</h2>
+      <p class="small muted" style="margin-top:0">Enter your squad code from ${esc(CFG.adminName || 'Rush')}'s invite. You only need to do this once on this phone.</p>
+      <form id="code-form" autocomplete="off">
+        <label class="field"><span>Squad code</span><input name="code" required autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="e.g. glow1234"></label>
+        <div class="err" id="code-err">${esc(msg || '')}</div>
+        <button class="btn primary block" type="submit">Continue</button>
+      </form>
+    </div>
+  </div>`;
+  $('#code-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const c = e.target.code.value.trim().toLowerCase(), btn = e.target.querySelector('button'); btn.disabled = true;
+    try {
+      const found = await api.squadByCode(c);
+      if (!found) throw new Error('That code didn\'t work. Check it with ' + (CFG.adminName || 'Rush') + '.');
+      rememberSquad(found.id, c); renderAuth();
+    } catch (ex) { $('#code-err').textContent = ex.message; btn.disabled = false; }
   };
 }
 
@@ -285,6 +373,15 @@ function render() {
   ({ today: renderToday, calendar: renderCalendar, track: renderTrack, food: renderFood, me: renderMe })[state.tab]();
 }
 const demoBanner = () => '';
+// Private progress: someone else's private walks, food, workouts etc. are never shown (the database won't send them)
+const hiddenFor = (p) => !!p && !!p.private_progress && !isMe(p.id);
+function privateCard(p, what) {
+  return `<div class="card center" style="padding:28px 18px">
+    <div style="font-size:34px;margin-bottom:6px">🔒</div>
+    <h3 style="margin:0 0 6px">${esc(p.display_name)} keeps ${what} private</h3>
+    <p class="small muted" style="margin:0">You can still see where she ranks on the leaderboard on Today.</p>
+  </div>`;
+}
 function peopleChips(onPick) {
   return `<div class="chips">${profiles.map(p => `<div class="chip ${state.viewUser === p.id ? 'on' : ''}" data-u="${p.id}">${avatar(p, 'sm')}${isMe(p.id) ? 'Me' : esc(p.display_name)}</div>`).join('')}</div>`;
 }
@@ -346,7 +443,12 @@ async function renderToday() {
   const mine = dayTotals(me.id, t, data);
   const myWater = water.find(w => w.user_id === me.id)?.glasses || 0;
   const weekSteps = (id) => Array.from({ length: 7 }, (_, i) => dayTotals(id, addDays(t, -i), data).steps).reduce((a, b) => a + b, 0);
-  const ranked = [...profiles].sort((a, b) => weekSteps(b.id) - weekSteps(a.id));
+  // Private members: we only get their position from the database, never their numbers
+  const pr = profiles.some(hiddenFor) ? (await api.privateRanks?.(t) || []).filter(r => !mySquads || r.squad_id === state.squad) : [];
+  const prOf = (id) => pr.find(r => r.user_id === id);
+  const ranked = profiles.filter(p => !hiddenFor(p)).sort((a, b) => weekSteps(b.id) - weekSteps(a.id));
+  profiles.filter(hiddenFor).map(p => [p, prOf(p.id)?.week_rank || profiles.length]).sort((a, b) => a[1] - b[1])
+    .forEach(([p, r]) => ranked.splice(Math.min(r - 1, ranked.length), 0, p));
   const hour = new Date().getHours();
   const goal = CFG.stepGoal || 10000, pct = Math.min(1, mine.steps / goal), C = 2 * Math.PI * 52;
   const myStreak = streak(me.id, data.acts, data.wos);
@@ -388,7 +490,8 @@ async function renderToday() {
   main.innerHTML = `<div class="screen">
     ${demoBanner()}
     <div class="row between" style="margin-bottom:12px"><div class="wordmark">Squad<span>Fit</span></div>${avatar(me, 'sm')}</div>
-    <div class="hero" style="background-image:url('${esc(picFor(me).src)}')">
+    ${squadSwitch()}
+    <div class="hero" style="${picFor(me) ? `background-image:url('${esc(picFor(me).src)}')` : 'background:linear-gradient(135deg,#5b2bb5,#c42f8a)'}">
       <div class="hero-txt"><div><div class="sub" style="color:#e9ddff">${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}</div>
         <h1>${hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'}, ${esc(me.display_name)}</h1></div>
 </div>
@@ -452,7 +555,11 @@ async function renderToday() {
 
     <div class="section-title">The squad today</div>
     <div class="card">
-      ${profiles.map(p => { const d = dayTotals(p.id, t, data); const s = streak(p.id, data.acts, data.wos); const g = goals[p.id];
+      ${profiles.map(p => { if (hiddenFor(p)) { const r = prOf(p.id); const lead = r?.today_rank === 1 && r.moved_today;
+          return `<div class="person" data-u="${p.id}">${avatar(p)}<div class="grow">
+          <div class="row between"><div class="name">${esc(p.display_name)}</div>${lead ? `<span class="pill">👑 Leading today</span>` : ''}</div>
+          <div class="pmeta"><span>🔒 Progress is private</span></div></div></div>`; }
+        const d = dayTotals(p.id, t, data); const s = streak(p.id, data.acts, data.wos); const g = goals[p.id];
         return `<div class="person" data-u="${p.id}">${avatar(p)}<div class="grow">
           <div class="row between"><div class="name">${esc(p.display_name)}${isMe(p.id) ? ' <span class="muted small">(you)</span>' : ''}</div>${s > 1 ? `<span class="pill">${ic('flame', 12)} ${s}</span>` : ''}</div>
           <div class="pmeta"><span>${ic('shoe', 13)}${fmtInt(d.steps)}</span><span>${ic('pin', 13)}${fmt1(d.miles)} mi</span><span>${ic('dumbbell', 13)}${d.workouts}</span><span>${ic('flame', 13)}${fmtInt(d.cal)}</span></div>
@@ -462,7 +569,7 @@ async function renderToday() {
 
     <div class="section-title">Steps leaderboard · this week</div>
     <div class="card">
-      ${ranked.map((p, i) => `<div class="lb">${rankBadge(i)}${avatar(p, 'sm')}<div class="grow">${esc(p.display_name)}</div><b>${fmtInt(weekSteps(p.id))}</b></div>`).join('')}
+      ${ranked.map((p, i) => `<div class="lb">${rankBadge(i)}${avatar(p, 'sm')}<div class="grow">${esc(p.display_name)}</div>${hiddenFor(p) ? `<span class="small muted">${i === 0 && prOf(p.id)?.moved_week ? '👑 Leading · ' : ''}🔒 Private</span>` : `<b>${fmtInt(weekSteps(p.id))}</b>`}</div>`).join('')}
     </div>
   </div>`;
   $('#q-live').onclick = () => openLive();
@@ -488,6 +595,10 @@ async function renderCalendar() {
   const first = new Date(y, mo - 1, 1), daysIn = new Date(y, mo, 0).getDate();
   const from = ymd(first), to = ymd(new Date(y, mo - 1, daysIn));
   const uidv = state.viewUser;
+  if (hiddenFor(byId(uidv))) {
+    main.innerHTML = `<div class="screen">${demoBanner()}<div class="topbar"><h1>Calendar</h1></div>${peopleChips()}${privateCard(byId(uidv), 'her walks and workouts')}</div>`;
+    bindChips(renderCalendar); return;
+  }
   const data = await loadRange(from, to, uidv);
   const has = (arr, d) => arr.some(r => r.day === d);
   const person = byId(uidv);
@@ -641,14 +752,16 @@ async function renderMoveForm() {
   const todays = (await api.list('activities', { userId: me.id, from: t, to: t }));
   $('#track-body').innerHTML = `
     <div class="card"><h2>${tile('nav', 'purple')} Live tracking</h2>
-      <p class="muted small" style="margin-top:0">Tracks pace and miles with GPS and counts steps from your phone's motion sensor. Keep the app open with the screen on while you go.</p>
+      <p class="muted small" style="margin-top:0">Pick your pace (Normal, Brisk, Fast, Jog or Run) and your steps never count lower than that pace, even with the screen locked. GPS tracks miles outdoors.</p>
       <button class="btn green block" id="start-live">${ic('play', 16)} Start walk or run</button></div>
     ${todays.length ? todayWalksCard(todays) : ''}
     <div class="card"><h2>${tile('pencil', 'pink')} Enter manually</h2>
-      <p class="muted small" style="margin-top:0">Copy your totals from Apple Health or Google Fit.</p>
+      <p class="muted small" style="margin-top:0">Copy your totals from Samsung Health, or pick a pace and your minutes and we'll fill in the steps.</p>
       <form id="move-form">
         <div class="seg" id="kind-seg"><button type="button" data-k="walk" class="on">Walk</button><button type="button" data-k="run">Run</button></div>
         <label class="field"><span>Date</span><input type="date" name="day" value="${today()}" max="${today()}" required></label>
+        <label class="field"><span>Pace <span class="opt">fills in steps from your minutes</span></span></label>
+        <div class="seg mini pace-pick" id="mf-pace">${PACES.filter(p => p.spm).map(p => `<button type="button" data-p="${p.k}">${p.label}</button>`).join('')}</div>
         <div class="grid3">
           <label class="field"><span>Steps</span><input name="steps" inputmode="numeric" type="number" min="0"></label>
           <label class="field"><span>Miles</span><input name="distance_mi" inputmode="decimal" type="number" step="0.01" min="0"></label>
@@ -662,6 +775,27 @@ async function renderMoveForm() {
   let kind = 'walk';
   $$('#kind-seg button').forEach(b => b.onclick = () => { $$('#kind-seg button').forEach(x => x.classList.remove('on')); b.classList.add('on'); kind = b.dataset.k; });
   $('#start-live').onclick = () => openLive();
+  // Pick a pace + minutes and the steps (and miles) fill themselves in
+  let mPace = null, autoSteps = null, autoMi = null;
+  const mf = $('#move-form'), fSteps = mf.elements.steps, fMi = mf.elements.distance_mi, fMin = mf.elements.duration_min;
+  const syncMP = () => $$('#mf-pace button').forEach(x => x.classList.toggle('on', x.dataset.p === mPace));
+  const fillFromPace = () => {
+    if (!mPace) return;
+    const p = paceOf(mPace), min = num(fMin.value) || 0;
+    if (!p.spm || !min) return;
+    const st = Math.round(min * p.spm);
+    if (!fSteps.value || +fSteps.value === autoSteps) { fSteps.value = st; autoSteps = st; }
+    const mi = +(st * strideMiles(p.kind)).toFixed(2);
+    if (!fMi.value || +fMi.value === autoMi) { fMi.value = mi; autoMi = mi; }
+  };
+  $$('#mf-pace button').forEach(b => b.onclick = () => {
+    mPace = b.dataset.p; syncMP();
+    const k = paceOf(mPace).kind;
+    if (k) { kind = k; $$('#kind-seg button').forEach(x => x.classList.toggle('on', x.dataset.k === k)); }
+    fillFromPace();
+  });
+  fMin.addEventListener('input', fillFromPace);
+  syncMP();
   $('#move-form').onsubmit = async (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
@@ -779,14 +913,37 @@ const strideMiles = (kind) => {
   return inches / 63360;
 };
 
+// Pace-based steps: realistic steps per minute for each pace
+const PACES = [
+  { k: 'off', label: 'Off', spm: 0, kind: null },
+  { k: 'normal', label: 'Normal', spm: 100, kind: 'walk' },
+  { k: 'brisk', label: 'Brisk', spm: 115, kind: 'walk' },
+  { k: 'fast', label: 'Fast', spm: 130, kind: 'walk' },
+  { k: 'jog', label: 'Jog', spm: 155, kind: 'run' },
+  { k: 'run', label: 'Run', spm: 170, kind: 'run' }];
+const paceOf = (k) => PACES.find(p => p.k === k) || PACES[1];
+const PACE_KEY = 'squadfit-pace';
+const STILL_SD = 0.6;   // phone jiggle (m/s²) below this = not walking. Walking is usually 1.5+, standing still with the phone in hand ~0.1-0.4
+const STILL_MS = 4000;  // must be still this long before pace steps pause
+const MOVE_SD = 1.0;    // movement this strong (or a detected step) = walking
+const GAP_MS = window.__gapMs || 90000;   // away (screen off / app closed) longer than this: check before counting that time
+const VEH_MPS = 3.1;    // GPS speed over ~7 mph = in a vehicle, not walking
+const savedPace = () => { try { return paceOf(localStorage.getItem(PACE_KEY) || 'normal').k; } catch { return 'normal'; } };
+
+// One walk at a time. While it runs you can back out to the rest of the app; a bar above the tabs keeps it handy
+let liveSession = null;
 function openLive(opts = {}) {
+  if (liveSession) { liveSession.show(); if (opts.continueAct) toast('Finish or save your current walk first'); return; }
   const L = { kind: 'walk', running: false, started: false, elapsed: 0, lastTick: 0, meters: 0, steps: 0, last: null, watch: null, timer: null, wake: null,
     counter: createStepCounter({ sensitivity: savedSensitivity() }), motionOk: false, motionWarned: false, motionN: 0,
-    indoor: (() => { try { return localStorage.getItem('squadfit-indoor') === '1'; } catch { return false; } })() };
+    indoor: (() => { try { return localStorage.getItem('squadfit-indoor') === '1'; } catch { return false; } })(), pace: savedPace(), paceSteps: 0 };
   const root = document.createElement('div'); root.className = 'live';
+  if (window.__skipConfirm) window.__L = L;   // test hook
   root.innerHTML = `
-    <div class="row between"><button class="btn ghost sm" id="l-close">${ic('x', 16)} Close</button><div class="seg" style="margin:0;width:170px" id="l-kind"><button data-k="walk" class="on">Walk</button><button data-k="run">Run</button></div></div>
+    <div class="row between"><button class="btn ghost sm" id="l-min">${ic('arrow-left', 16)} Back</button><div class="seg" style="margin:0;width:150px" id="l-kind"><button data-k="walk" class="on">Walk</button><button data-k="run">Run</button></div><button class="btn ghost sm icon-only" id="l-close" aria-label="Close">${ic('x', 16)}</button></div>
     <div class="seg mini" id="l-where" style="margin:16px auto 0;width:max-content"><button data-w="out">Outdoors (GPS)</button><button data-w="in">Indoors</button></div>
+    <div class="pace-label small muted">Your pace <span class="opt">steps never count lower than this pace</span></div>
+    <div class="seg mini pace-pick" id="l-pacepick">${PACES.map(p => `<button data-p="${p.k}">${p.label}</button>`).join('')}</div>
     <div class="big" id="l-time">0:00</div><div class="center muted">duration</div>
     <div class="lstats">
       <div><span class="lic">${ic('pin', 18)}</span><b id="l-dist">0.00</b><span>miles</span></div>
@@ -796,13 +953,17 @@ function openLive(opts = {}) {
     </div>
     <div class="status" id="l-status">Tap Start when you're ready. Keep this screen open.</div>
     <div class="sensor-row">
-      <span class="small muted" id="l-sensor">${ic('activity', 13)} Step sensor: waiting</span>
+      <span class="small muted" style="flex-basis:100%;text-align:center"><span id="l-sensor">${ic('activity', 13)} Step sensor: waiting</span><span id="l-move"></span></span>
       <button class="btn ghost sm" id="l-cal-btn" style="padding:4px 8px">${ic('target', 14)} Calibrate</button>
       <button class="btn ghost sm" id="l-add-btn" style="padding:4px 8px">${ic('plus', 14)} Add from watch</button>
     </div>
     <div class="controls" id="l-controls"><button class="btn green block" id="l-start" >${ic('play', 18)} Start</button></div>`;
   document.body.appendChild(root);
   const status = (s) => $('#l-status', root).textContent = s;
+  // Steps shown and saved: the higher of the step sensor and the pace math
+  const shown = () => Math.max(L.steps || 0, (L.baseSteps || 0) + (L.extraSteps || 0) + Math.round(L.paceSteps || 0));
+  const syncPace = () => $$('#l-pacepick button', root).forEach(x => x.classList.toggle('on', x.dataset.p === L.pace));
+  const paceMsg = () => { const p = paceOf(L.pace); return p.spm ? `${p.label} pace: at least ${p.spm} steps a minute. It auto-pauses when you stand still.` : 'Pace off: steps come from the step counter only.'; };
   // Continue a saved walk: start from its numbers and update the same entry when you finish
   if (opts.continueAct) {
     const c = opts.continueAct;
@@ -812,6 +973,15 @@ function openLive(opts = {}) {
     setTimeout(() => { update(); status(`Continuing your ${L.kind}: ${fmtInt(L.steps)} steps so far. Tap Start to keep going.`); }, 0);
   }
   $$('#l-kind button', root).forEach(b => b.onclick = () => { $$('#l-kind button', root).forEach(x => x.classList.remove('on')); b.classList.add('on'); L.kind = b.dataset.k; update(); });
+  $$('#l-pacepick button', root).forEach(b => b.onclick = () => {
+    if (L.running) tick();                       // bank the time at the old pace first
+    L.pace = b.dataset.p; syncPace();
+    try { localStorage.setItem(PACE_KEY, L.pace); } catch { }
+    const k = paceOf(L.pace).kind;
+    if (k && k !== L.kind) { L.kind = k; $$('#l-kind button', root).forEach(x => x.classList.toggle('on', x.dataset.k === L.kind)); }
+    update(); persist(); status(paceMsg());
+  });
+  syncPace();
   const syncWhere = () => $$('#l-where button', root).forEach(x => x.classList.toggle('on', (x.dataset.w === 'in') === L.indoor));
   syncWhere();
   $$('#l-where button', root).forEach(b => b.onclick = () => {
@@ -842,24 +1012,58 @@ function openLive(opts = {}) {
   $('#l-cal-btn', root).onclick = () => { if (L.running) { toast('Pause first, then calibrate'); return; } openCalibrate(() => { L.counter = createStepCounter({ sensitivity: savedSensitivity() }); L.counter.steps = L.steps; }); };
 
   // Indoors: distance comes from steps. Outdoors: from GPS.
-  const miles = () => L.indoor ? (L.steps - (L.extraSteps || 0) - (L.baseSteps || 0)) * strideMiles(L.kind) + (L.extraMi || 0) + (L.contId ? (L.baseMi || 0) : 0) : L.meters / 1609.34;
+  const miles = () => L.indoor ? (shown() - (L.extraSteps || 0) - (L.baseSteps || 0)) * strideMiles(L.kind) + (L.extraMi || 0) + (L.contId ? (L.baseMi || 0) : 0) : L.meters / 1609.34;
   const update = () => {
     const min = L.elapsed / 60000;
     $('#l-time', root).textContent = clock(L.elapsed);
     $('#l-dist', root).textContent = miles().toFixed(2);
     $('#l-pace', root).textContent = miles() > 0.02 ? paceStr(min / miles()) : '--:--';
-    $('#l-steps', root).textContent = fmtInt(L.steps);
-    $('#l-cal', root).textContent = fmtInt(moveCalories({ kind: L.kind, duration_min: min, distance_mi: miles(), steps: L.steps }));
+    $('#l-steps', root).textContent = fmtInt(shown());
+    $('#l-cal', root).textContent = fmtInt(moveCalories({ kind: L.kind, duration_min: min, distance_mi: miles(), steps: shown() }));
+    refreshBar();
   };
+  // ---- Mini bar shown while you use the rest of the app ----
+  let bar = null;
+  const refreshBar = () => {
+    if (!bar) return;
+    $('.lb-time', bar).textContent = clock(L.elapsed);
+    $('.lb-stats', bar).textContent = `${fmtInt(shown())} steps · ${miles().toFixed(2)} mi`;
+    $('.lb-dot', bar).classList.toggle('on', !!L.running && !L.wasStill);
+    $('.lb-btn', bar).innerHTML = L.running ? ic('pause', 18) : ic('play', 18);
+    $('.lb-btn', bar).setAttribute('aria-label', L.running ? 'Pause' : 'Resume');
+  };
+  const minimize = () => {
+    root.style.display = 'none';
+    if (!bar) {
+      bar = document.createElement('div'); bar.className = 'livebar';
+      bar.innerHTML = `<button class="lb-open"><span class="lb-dot"></span><span class="lb-kind">${L.kind === 'run' ? 'Run' : 'Walk'}</span><b class="lb-time"></b><span class="lb-stats"></span></button><button class="lb-btn"></button>`;
+      $('.lb-open', bar).onclick = () => liveSession.show();
+      $('.lb-btn', bar).onclick = () => { L.running ? pause() : resume(); refreshBar(); };
+      document.body.append(bar);
+    }
+    $('.lb-kind', bar).textContent = L.kind === 'run' ? 'Run' : 'Walk';
+    document.body.classList.add('has-livebar'); refreshBar(); persist();
+  };
+  const endLive = () => {
+    bar?.remove(); bar = null; document.body.classList.remove('has-livebar');
+    document.removeEventListener('visibilitychange', onVis);
+    root.remove(); liveSession = null;
+  };
+  liveSession = { show: () => { root.style.display = ''; bar?.remove(); bar = null; document.body.classList.remove('has-livebar'); update(); persist(); } };
   const onPos = (p) => {
     const { latitude: lat, longitude: lon, accuracy } = p.coords;
     if (accuracy > 35) { status(`Waiting for a better GPS signal (±${Math.round(accuracy)}m)…`); return; }
     status('GPS locked. Go go go!');
     const pt = { lat, lon, t: p.timestamp };
+    // Vehicle check: going faster than walking/running pace for 10+ seconds = in a car/bus. Back to normal after 45s slow.
+    const spd = p.coords.speed != null && p.coords.speed >= 0 ? p.coords.speed : (L.last && pt.t > L.last.t ? haversine(L.last, pt) / ((pt.t - L.last.t) / 1000) : 0);
+    if (spd > VEH_MPS) { L.slowSince = 0; L.fastSince ||= pt.t; if (!L.inVehicle && pt.t - L.fastSince >= 10000) { L.inVehicle = true; status('Looks like you\'re in a vehicle, so the walk is paused. It picks up again when you walk.'); } }
+    else if (spd < 2.2) { L.fastSince = 0; L.slowSince ||= pt.t; if (L.inVehicle && pt.t - L.slowSince >= 45000) L.inVehicle = false; }
+    if (L.wasStill || L.inVehicle) { L.last = pt; return; }   // auto-paused: no miles from GPS drift or driving
     if (L.last) {
       const d = haversine(L.last, pt), dt = (pt.t - L.last.t) / 1000;
       if (d < 3) return;                       // ignore jitter
-      if (dt > 0 && d / dt > 12) { L.last = pt; return; } // ignore impossible jumps
+      if (dt > 0 && d / dt > VEH_MPS) { L.last = pt; return; } // faster than running: a vehicle (or a GPS jump), not miles walked
       L.meters += d;
     }
     L.last = pt; update();
@@ -874,25 +1078,106 @@ function openLive(opts = {}) {
     // Keep the first 3 minutes of motion so the counter can be tuned to real phones
     if (!L.rec) L.rec = [];
     if (L.rec.length < 10800) L.rec.push([Math.round(e.timeStamp || performance.now()), +m.toFixed(2)]);
+    // Standing-still check: how much the phone has been jiggling over the last 2.5 seconds
+    const now = Date.now(); L.lastMotionAt = now;
+    const w = (L.mwin = L.mwin || []); w.push([now, m]); while (w.length && now - w[0][0] > 2500) w.shift();
+    let calm = false;
+    if (w.length > 15) {
+      let sum = 0, sq = 0; for (const [, v] of w) { sum += v; sq += v * v; }
+      const mean = sum / w.length, sd = Math.sqrt(Math.max(0, sq / w.length - mean * mean));
+      L.sd = sd;
+      if (sd >= MOVE_SD) L.lastMoveAt = now;   // walking-strength movement (a car's hum is gentler)
+      else if (sd < STILL_SD) calm = now - w[0][0] > 2000;     // a full 2+ seconds of barely any movement
+    }
     const before = L.counter.steps;
     L.steps = L.counter.push(m, e.timeStamp || performance.now());
-    if (L.steps !== before) { $('#l-steps', root).textContent = fmtInt(L.steps); if (L.indoor) update(); }
+    if (calm && L.steps !== before) { L.counter.steps = before; L.steps = before; }
+    else if (L.steps !== before && L.wasStill && (L.sd || 0) < MOVE_SD) { L.counter.steps = before; L.steps = before; }   // paused: car hum / fidgeting isn't steps
+    else if (L.steps !== before && (L.sd || 0) >= STILL_SD) L.lastMoveAt = now;   // a real step = moving   // shuffling or handling the phone while stood still: not steps
+    if (L.steps !== before) { $('#l-steps', root).textContent = fmtInt(shown()); if (L.indoor) update(); }
   };
   const LIVE_KEY = 'squadfit-live-' + me.id;
-  const persist = () => { try { localStorage.setItem(LIVE_KEY, JSON.stringify({ kind: L.kind, elapsed: L.elapsed, meters: L.meters, steps: L.steps, extraSteps: L.extraSteps || 0, extraMi: L.extraMi || 0, contId: L.contId || null, autoCreated: !!L.autoCreated, baseSteps: L.baseSteps || 0, baseMi: L.baseMi || 0, baseMin: L.baseMin || 0, indoor: L.indoor, segs: L.segs || [], at: Date.now(), day: today() })); } catch { } };
+  const persist = () => { try { localStorage.setItem(LIVE_KEY, JSON.stringify({ kind: L.kind, elapsed: L.elapsed, meters: L.meters, steps: L.steps, extraSteps: L.extraSteps || 0, extraMi: L.extraMi || 0, contId: L.contId || null, autoCreated: !!L.autoCreated, baseSteps: L.baseSteps || 0, baseMi: L.baseMi || 0, baseMin: L.baseMin || 0, indoor: L.indoor, segs: L.segs || [], pace: L.pace, paceSteps: L.paceSteps || 0, running: !!L.running, minimized: !!bar, hiddenAt: L.hiddenAt || 0, at: Date.now(), day: today() })); } catch { } };
   const clearSaved = () => { try { localStorage.removeItem(LIVE_KEY); } catch { } };
   const tick = () => {
-    const n = Date.now(); L.elapsed += n - L.lastTick; L.lastTick = n; update(); persist();
+    const n = Date.now(); let dt = n - L.lastTick; L.lastTick = n;
+    // Screen off / in another app: nothing is counted live; it's checked when you come back (see onVis)
+    if (L.running && (L.hiddenAt || document.visibilityState === 'hidden')) { persist(); return; }
+    // Back after a long time away: don't assume it was all walking (could've been sitting or driving). Check first.
+    if (L.running && dt > GAP_MS) { const from = n - dt; dt = 0; handleGap(from, n); }
+    // Pace steps keep adding while moving, and while the screen is locked (no sensor then, so we trust the pace).
+    // They stop when the sensor shows you've been standing still for a few seconds.
+    const sensorLive = !L.hiddenAt && document.visibilityState !== 'hidden' && n - (L.lastMotionAt || 0) < 2000;
+    const still = (sensorLive && n - (L.lastMoveAt || 0) > STILL_MS) || !!L.inVehicle;
+    // Auto-pause: standing still stops the clock (and so calories), pace steps and miles
+    if (!still) L.elapsed += dt;
+    if (L.running && !still) L.paceSteps = (L.paceSteps || 0) + dt / 60000 * paceOf(L.pace).spm;
+    const mv = $('#l-move', root);
+    if (mv) mv.textContent = sensorLive ? ` · movement ${(L.sd || 0).toFixed(2)}${still ? ' (still)' : ''}` : (L.running ? ' · no motion data' : '');
+    if (L.running && still !== L.wasStill) {
+      L.wasStill = still;
+      const el = $('#l-sensor', root);
+      if (still) {   // take back the few seconds you were already stood still before we noticed
+        const back = Math.min(n - (L.lastMoveAt || n), STILL_MS + 3000);
+        L.paceSteps = Math.max(0, (L.paceSteps || 0) - back / 60000 * paceOf(L.pace).spm);
+        L.elapsed = Math.max(0, L.elapsed - back);
+        update();
+      }
+      if (still) { el.innerHTML = L.inVehicle ? `${ic('pause', 13)} In a vehicle: auto-paused` : `${ic('pause', 13)} Not moving: auto-paused`; el.style.color = 'var(--gold, #ffc94d)'; }
+      else if (L.motionOk) { el.innerHTML = `${ic('check', 13)} Step sensor: working`; el.style.color = 'var(--move)'; }
+    }
+    update(); persist();
     // Auto-save every minute while walking, so the squad sees steps as they happen
-    if (L.running && n - (L.lastAuto || n) >= 60000) { L.lastAuto = n; if ((L.steps || null) !== L.savedSteps) saveProgress().catch(() => {}); }
+    if (L.running && n - (L.lastAuto || n) >= 60000) { L.lastAuto = n; if ((shown() || null) !== L.savedSteps) saveProgress().catch(() => {}); }
+  };
+  // Steps the phone itself counted between two times (Android app, from Samsung Health / Health Connect)
+  const phoneStepsBetween = async (a, b) => {
+    const H = nativeHealth(); if (!H) return null;
+    try {
+      const { samples = [] } = await H.queryAggregated({ dataType: 'steps', startDate: new Date(a).toISOString(), endDate: new Date(b).toISOString(), bucket: 'hour', aggregation: 'sum' });
+      return Math.round(samples.reduce((x, sm) => x + (sm.value || 0), 0));
+    } catch (e) { console.warn('gap steps', e); return null; }
+  };
+  // Credit time away only for real movement, so a drive (or sitting on the couch) never counts as walking
+  const handleGap = async (a, b) => {
+    const gap = b - a, mins = Math.max(1, Math.round(gap / 60000)), spm = paceOf(L.pace).spm || 100;
+    const credit = (ms, steps) => { L.elapsed += ms; L.paceSteps = (L.paceSteps || 0) + steps; update(); persist(); };
+    if (L.indoor && !nativeHealth()) { credit(gap, gap / 60000 * paceOf(L.pace).spm); return; }   // treadmill/indoors: no driving
+    const steps = await phoneStepsBetween(a, b);
+    if (steps != null) {
+      // The phone's own step chip: real steps only. Time counted = how long those steps take at your pace.
+      const ms = Math.min(gap, steps / spm * 60000);
+      credit(ms, steps);
+      const skipped = Math.round((gap - ms) / 60000);
+      status(skipped >= 2 ? `Welcome back! Counted ${fmtInt(steps)} real steps while you were away. ${skipped} min looked like sitting or driving, so it wasn't counted.` : `Welcome back! Counted ${fmtInt(steps)} steps from your phone while you were away.`);
+      return;
+    }
+    // No phone step data: ask instead of guessing
+    openSheet(`<h3>You were away ${mins} min</h3>
+      <p class="muted" style="margin-top:0">Were you walking or running that whole time? If you were driving or sitting, we won't count it.</p>
+      <button class="btn primary block" id="gap-yes">Yes, count it</button>
+      <button class="btn block" id="gap-no" style="margin-top:8px">No, don't count it</button>`, (sh) => {
+      $('#gap-yes', sh).onclick = () => { credit(gap, gap / 60000 * paceOf(L.pace).spm); closeSheet(); status(`Added ${mins} min of walking.`); };
+      $('#gap-no', sh).onclick = () => { closeSheet(); status(mins === 1 ? 'Got it. That minute wasn\'t counted.' : `Got it. Those ${mins} min weren't counted.`); };
+    });
   };
   const onVis = async () => {
     if (!L.running) return;
-    if (document.visibilityState === 'hidden') { L.hiddenAt = Date.now(); return; }
-    if (L.hiddenAt && nativeHealth()) { L.hiddenAt = 0; if (await syncWalkFromPhone()) status('Welcome back! Steps caught up from your phone\'s step counter.'); }
+    if (document.visibilityState === 'hidden') { tick(); L.hiddenAt = Date.now(); persist(); return; }
+    const goneMs = L.hiddenAt ? Date.now() - L.hiddenAt : 0;
+    if (L.hiddenAt) {
+      // Short trip out of the app: count it at your pace. Long: only real steps / ask (could've been a drive)
+      if (goneMs > GAP_MS) handleGap(L.hiddenAt, Date.now());
+      else { L.elapsed += goneMs; L.paceSteps = (L.paceSteps || 0) + goneMs / 60000 * paceOf(L.pace).spm; }
+    }
+    L.lastTick = Date.now(); L.lastMoveAt = Date.now(); L.mwin = []; L.wasStill = false;   // fresh start for the stand-still check
+    const wasHidden = L.hiddenAt; L.hiddenAt = 0; tick(); L.hiddenAt = wasHidden;
+    if (L.hiddenAt && nativeHealth()) { L.hiddenAt = 0; if (await syncWalkFromPhone() && goneMs <= GAP_MS) status('Welcome back! Steps caught up from your phone\'s step counter.'); }
     else if (L.hiddenAt) {
       const gone = Date.now() - L.hiddenAt; L.hiddenAt = 0; L.hiddenMs = (L.hiddenMs || 0) + gone;
-      if (gone > 15000) status(`Steps paused for ${Math.round(gone / 60000) || '<1'} min while the screen was off. Keep the screen on for the best count. You can add the missing steps when you finish.`);
+      if (gone > GAP_MS) { /* handled by the "were you walking?" check */ }
+      else if (gone > 15000 && paceOf(L.pace).spm) status(`Welcome back! Your ${paceOf(L.pace).label.toLowerCase()} pace kept counting while the screen was off.`);
+      else if (gone > 15000) status(`Steps paused for ${Math.round(gone / 60000) || '<1'} min while the screen was off. Keep the screen on for the best count. You can add the missing steps when you finish.`);
     }
     if (!L.wake) { try { L.wake = await navigator.wakeLock?.request('screen'); L.wake?.addEventListener?.('release', () => { L.wake = null; }); } catch { } }
   };
@@ -906,14 +1191,17 @@ function openLive(opts = {}) {
         if (r !== 'granted') { L.motionWarned = true; status('Step counting needs Motion access. Close and reopen the app, tap Start and choose Allow. Miles and time still count.'); }
       }
       // If the phone sends no motion at all, say so instead of silently showing 0 steps
-      setTimeout(() => { if (L.running && !L.motionOk && !L.motionWarned) { L.motionWarned = true; $('#l-sensor', root).innerHTML = `${ic('x', 13)} Step sensor: not working`; $('#l-sensor', root).style.color = 'var(--danger)'; status('Your phone isn\'t sending motion to the app. iPhone: Settings > Apps > Safari > Motion & Orientation Access ON, then reopen the app.'); } }, 4000);
+      setTimeout(() => { if (L.running && !L.motionOk && !L.motionWarned) { L.motionWarned = true; $('#l-sensor', root).innerHTML = `${ic('x', 13)} Step sensor: not working`; $('#l-sensor', root).style.color = 'var(--danger)'; if (!paceOf(L.pace).spm) status('Your phone isn\'t sending motion to the app. iPhone: Settings > Apps > Safari > Motion & Orientation Access ON, then reopen the app.'); } }, 4000);
     }
-    L.running = true; L.lastTick = Date.now(); L.lastAuto = Date.now();
-    (L.segs = L.segs || []).push([Date.now(), null]);  // walking time windows (for the phone's step counter)
+    L.running = true; L.lastTick = Date.now(); L.lastAuto = Date.now(); L.lastMoveAt = Date.now(); L.wasStill = false; L.mwin = [];
+    L.segs = L.segs || [];   // walking time windows (for the phone's step counter)
+    if (!(L.reopened && L.segs.length && L.segs[L.segs.length - 1][1] == null)) L.segs.push([Date.now(), null]);
+    L.reopened = false;
     if (nativeHealth()) status('Counting with your phone\'s step counter, so steps still count if you lock the screen or leave the app.');
+    else status(paceMsg());
     L.timer = setInterval(tick, 1000);
     window.addEventListener('devicemotion', onMotion);
-    if (L.indoor) status('Indoors: counting steps. Miles are worked out from your steps.');
+    if (L.indoor) { if (!paceOf(L.pace).spm) status('Indoors: counting steps. Miles are worked out from your steps.'); }
     else if ('geolocation' in navigator) {
       L.last = null;
       L.watch = navigator.geolocation.watchPosition(onPos, (err) => status(err.code === 1 ? 'Location is blocked. Allow location for this site to track miles.' : 'GPS unavailable right now. Steps and time still count.'), { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
@@ -924,10 +1212,11 @@ function openLive(opts = {}) {
   const pause = () => {
     L.running = false; clearInterval(L.timer); tick();
     if (L.segs?.length && !L.segs[L.segs.length - 1][1]) L.segs[L.segs.length - 1][1] = Date.now();
+    persist();
     window.removeEventListener('devicemotion', onMotion);
     if (L.watch != null) navigator.geolocation.clearWatch(L.watch);
     L.wake?.release?.(); L.wake = null;
-    status('Paused'); controls();
+    status('Paused'); controls(); refreshBar();
   };
   // Save the walk so far, so steps show everywhere (home, calendar, leaderboard) right away
   // Android app: ask the phone's own step counter (Health Connect) how many steps were taken during this walk.
@@ -948,7 +1237,7 @@ function openLive(opts = {}) {
     } catch (e) { console.warn('walk steps from phone', e); return false; }
   };
   const rowNow = () => {
-    const row = { kind: L.kind, steps: L.steps || null, distance_mi: +miles().toFixed(2) || null, duration_min: Math.round(L.elapsed / 600) / 100 || null };
+    const row = { kind: L.kind, steps: shown() || null, distance_mi: +miles().toFixed(2) || null, duration_min: Math.round(L.elapsed / 600) / 100 || null };
     row.calories = moveCalories(row); return row;
   };
   const saveProgress = async () => {
@@ -966,8 +1255,8 @@ function openLive(opts = {}) {
     L.rec = [];
   };
   const pauseAndSave = async () => {
-    pause(); await syncWalkFromPhone(); sendRecording(L.steps);
-    try { if (await saveProgress()) { status(`Paused and saved: ${fmtInt(L.steps)} steps. Tap Resume to keep going.`); toast('Saved'); } }
+    pause(); await syncWalkFromPhone(); sendRecording(shown());
+    try { if (await saveProgress()) { status(`Paused and saved: ${fmtInt(shown())} steps. Tap Resume to keep going.`); toast('Saved'); } }
     catch (e) { status('Paused. Couldn\'t save (no connection?). Tap Finish & save when you\'re back online.'); }
   };
   const finish = async () => {
@@ -976,18 +1265,20 @@ function openLive(opts = {}) {
     const duration_min = Math.round(L.elapsed / 600) / 100;
     const mi = +miles().toFixed(2);
     const est = !L.indoor && mi >= 0.05 ? Math.round(mi / strideMiles(L.kind)) : 0;
-    if (!L.steps && !est && duration_min < 0.2) { toast('Nothing recorded yet'); return; }
-    const suggested = L.steps || est;
+    if (!shown() && !est && duration_min < 0.2) { toast('Nothing recorded yet'); return; }
+    const byPace = Math.round(L.paceSteps || 0) > 0 && shown() > (L.steps || 0);
+    const suggested = shown() || est;
     if (L.hiddenAt) { L.hiddenMs = (L.hiddenMs || 0) + (Date.now() - L.hiddenAt); L.hiddenAt = 0; }
     const activeMin = Math.max(0.1, (L.elapsed - (L.hiddenMs || 0)) / 60000), offMin = (L.hiddenMs || 0) / 60000;
     const cadence = Math.min(190, L.steps / activeMin); // steps per minute while counting
-    const missing = offMin >= 0.5 && L.steps >= 30 ? Math.round(cadence * offMin) : 0;
+    const missing = !byPace && offMin >= 0.5 && L.steps >= 30 ? Math.round(cadence * offMin) : 0;
     // Let them check the numbers before saving (e.g. against Apple Health / Google Fit)
     openSheet(`<h3>Save your ${L.kind}</h3>
       <p class="muted small" style="margin-top:0">Check your steps before saving. You can fix them if they look off.</p>
       <label class="field"><span>Steps <span class="opt">fix this if you counted your steps</span></span><input id="sv-steps" type="number" inputmode="numeric" min="0" value="${suggested || ''}"></label>
       ${missing ? `<div class="notice"><div>The screen was off for about <b>${Math.round(offMin)} min</b>, so steps weren't counted then. At your pace that's about <b>${fmtInt(missing)}</b> more. <button type="button" class="btn sm" id="sv-fill" style="margin-top:6px">Add ${fmtInt(missing)} steps</button></div></div>` : ''}
-      ${est && L.steps && Math.abs(est - L.steps) / Math.max(est, 1) > 0.25 ? `<div class="notice"><div>Your phone counted <b>${fmtInt(L.steps)}</b> steps. Your ${mi} mi suggests about <b>${fmtInt(est)}</b>. <button type="button" class="btn sm" id="sv-est" style="margin-top:6px">Use ${fmtInt(est)}</button></div></div>` : ''}
+      ${byPace ? `<div class="muted small" style="margin:-4px 0 10px">Worked out from your pace${L.steps ? ` (step counter had ${fmtInt(L.steps)})` : ''}.</div>` : ''}
+      ${est && L.steps && !byPace && Math.abs(est - L.steps) / Math.max(est, 1) > 0.25 ? `<div class="notice"><div>Your phone counted <b>${fmtInt(L.steps)}</b> steps. Your ${mi} mi suggests about <b>${fmtInt(est)}</b>. <button type="button" class="btn sm" id="sv-est" style="margin-top:6px">Use ${fmtInt(est)}</button></div></div>` : ''}
       <label class="field"><span>Miles</span><input id="sv-mi" type="number" inputmode="decimal" step="0.01" min="0" value="${mi || ''}"></label>
       <div class="muted small" style="margin-bottom:12px">Time: ${clock(L.elapsed)}</div>
       <button class="btn primary block" id="sv-save">Save</button>`, (sheet) => {
@@ -1001,7 +1292,7 @@ function openLive(opts = {}) {
         sendRecording(row.steps);
         L.contId = null;
         clearSaved(); document.removeEventListener('visibilitychange', onVis);
-        closeSheet(); root.remove(); toast('Saved! Great job'); render();
+        closeSheet(); endLive(); toast('Saved! Great job'); render();
       };
     });
   };
@@ -1012,7 +1303,7 @@ function openLive(opts = {}) {
       if (L.contId && L.autoCreated) await api.remove('activities', L.contId);                     // walk started in this session: remove it
       else if (L.contId) { const base = { steps: L.baseSteps || null, distance_mi: L.baseMi || null, duration_min: L.baseMin || null }; base.calories = moveCalories({ kind: L.kind, ...base }); await api.update('activities', L.contId, base); } // continued walk: back to how it was
     } catch (e) { console.warn(e); }
-    Object.assign(L, { elapsed: 0, meters: 0, steps: 0, last: null, started: false, hiddenMs: 0, hiddenAt: 0, extraSteps: 0, extraMi: 0, contId: null, autoCreated: false, baseSteps: 0, baseMi: 0, baseMin: 0, segs: [] });
+    Object.assign(L, { paceSteps: 0, elapsed: 0, meters: 0, steps: 0, last: null, started: false, hiddenMs: 0, hiddenAt: 0, extraSteps: 0, extraMi: 0, contId: null, autoCreated: false, baseSteps: 0, baseMi: 0, baseMin: 0, segs: [] });
     L.counter = createStepCounter({ sensitivity: savedSensitivity() });
     clearSaved(); update(); controls(); status('Cleared. Tap Start when you\'re ready.');
   };
@@ -1030,27 +1321,40 @@ function openLive(opts = {}) {
   try {
     const saved = JSON.parse(localStorage.getItem(LIVE_KEY) || 'null');
     if (!opts.continueAct && saved && saved.day === today() && Date.now() - saved.at < 6 * 3600e3 && saved.elapsed > 5000) {
-      Object.assign(L, { kind: saved.kind, elapsed: saved.elapsed, meters: saved.meters, steps: saved.steps, started: true, extraSteps: saved.extraSteps || 0, extraMi: saved.extraMi || 0, contId: saved.contId || null, autoCreated: !!saved.autoCreated, baseSteps: saved.baseSteps || 0, baseMi: saved.baseMi || 0, baseMin: saved.baseMin || 0, indoor: !!saved.indoor, segs: saved.segs || [] });
-      syncWhere();
+      Object.assign(L, { kind: saved.kind, elapsed: saved.elapsed, meters: saved.meters, steps: saved.steps, started: true, extraSteps: saved.extraSteps || 0, extraMi: saved.extraMi || 0, contId: saved.contId || null, autoCreated: !!saved.autoCreated, baseSteps: saved.baseSteps || 0, baseMi: saved.baseMi || 0, baseMin: saved.baseMin || 0, indoor: !!saved.indoor, segs: saved.segs || [], pace: saved.pace || L.pace, paceSteps: saved.paceSteps || 0 });
+      syncWhere(); syncPace();
       L.counter.steps = saved.steps || 0;
       $$('#l-kind button', root).forEach(x => x.classList.toggle('on', x.dataset.k === L.kind));
-      update(); status('We saved your unfinished session. Resume or finish & save.');
+      if (saved.running) {
+        // The phone closed the app while you were walking: carry on as if it never stopped.
+        // The time away counts like a locked screen (pace steps keep adding; Android adds real phone steps on pause/finish).
+        const away = Math.max(0, Math.min(Date.now() - (saved.hiddenAt || saved.at), 3 * 3600e3));   // from when you left the app
+        L.reopened = true;
+        if (away > GAP_MS) setTimeout(() => handleGap(Date.now() - away, Date.now()), 300);
+        else { L.elapsed += away; L.paceSteps = (L.paceSteps || 0) + away / 60000 * paceOf(L.pace).spm; }
+        if (saved.minimized) setTimeout(() => minimize(), 0);   // you'd backed out to the app: come back to the dashboard + mini bar
+        setTimeout(() => { resume().then(() => { if (away <= GAP_MS) status('Still going!'); }); }, 0);
+      } else { update(); status('We saved your unfinished session. Resume or finish & save.'); }
     } else if (!opts.continueAct) clearSaved();
   } catch { }
   if (opts.continueAct) L.started = true;
   controls();
   $('#l-close', root).onclick = () => {
-    const unsaved = L.started && L.elapsed > 5000 && (!L.contId || L.savedSteps !== (L.steps || null));
+    const unsaved = L.started && L.elapsed > 5000 && (!L.contId || L.savedSteps !== (shown() || null));
     if (unsaved && !window.__skipConfirm && !confirm('You have steps that aren\'t saved yet. Close without saving them?')) return;
     if (L.running) pause();
-    clearSaved(); document.removeEventListener('visibilitychange', onVis);
-    root.remove(); render();
+    clearSaved(); endLive(); render();
   };
+  $('#l-min', root).onclick = () => { minimize(); render(); };
 }
 
 // ============ FOOD ============
 async function renderFood() {
   const main = $('#main'), day = state.foodDay, uidv = state.viewUser, mineView = isMe(uidv);
+  if (hiddenFor(byId(uidv))) {
+    main.innerHTML = `<div class="screen">${demoBanner()}<div class="topbar"><h1>Food diary</h1></div>${peopleChips()}${privateCard(byId(uidv), 'her food and water')}</div>`;
+    bindChips(renderFood); return;
+  }
   const [meals, waterRows] = await Promise.all([api.list('meals', { userId: uidv, from: day, to: day }), api.listWater({ from: day, to: day })]);
   const glasses = waterRows.find(w => w.user_id === uidv)?.glasses || 0;
   const photos = await Promise.all(meals.map(m => api.photoUrl(m.photo_path)));
@@ -1082,15 +1386,30 @@ async function renderFood() {
   bindDeletes(main, renderFood);
 }
 function guessMeal() { const h = new Date().getHours(); return h < 11 ? 'Breakfast' : h < 15 ? 'Lunch' : h < 21 ? 'Dinner' : 'Snack'; }
+// Samsung "high efficiency" photos (HEIF/HEIC) can't be read by the browser, so convert those first (converter only loads when needed)
+let heicLib = null;
+const loadHeic = () => heicLib ||= new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'vendor/heic2any.min.js'; sc.onload = () => res(window.heic2any); sc.onerror = () => { heicLib = null; rej(new Error('converter')); }; document.head.append(sc); });
+const looksHeic = (f) => /hei[cf]/i.test(f.type || '') || /\.hei[cf]$/i.test(f.name || '');
+async function decodeImage(blob) {
+  if (window.createImageBitmap) { try { return await createImageBitmap(blob, { imageOrientation: 'from-image' }); } catch { } }
+  const url = URL.createObjectURL(blob);
+  try { return await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; }); }
+  finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
 async function resizeImage(file, max = 1000) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
-    const scale = Math.min(1, max / Math.max(img.width, img.height));
-    const c = document.createElement('canvas'); c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
-    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.75));
-  } finally { URL.revokeObjectURL(url); }
+  let img = null;
+  if (!looksHeic(file)) { try { img = await decodeImage(file); } catch { } }
+  if (!img) {   // HEIF/HEIC, or something the phone's browser couldn't open: convert to JPEG then try again
+    const h2a = await loadHeic();
+    const out = await h2a({ blob: file, toType: 'image/jpeg', quality: 0.85 });
+    img = await decodeImage(Array.isArray(out) ? out[0] : out);
+  }
+  const w = img.width, h = img.height;
+  const scale = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * scale)); c.height = Math.max(1, Math.round(h * scale));
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  img.close?.();
+  return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
 }
 function openMealSheet(day) {
   const g = guessMeal();
@@ -1102,7 +1421,7 @@ function openMealSheet(day) {
       <label class="field"><span>Photo of your meal <span class="opt">optional</span></span>
         <div class="photo-drop" id="photo-drop">${ic('camera', 26)}<b>Add a photo</b><small>Take one or choose from your gallery</small>
           <img id="meal-preview" alt=""><button type="button" class="photo-x" id="photo-x" aria-label="Remove photo">${ic('x', 16)}</button></div>
-        <input name="photo" type="file" accept="image/*" hidden></label>
+        <input name="photo" type="file" accept="image/*,.heic,.heif" hidden></label>
       <div class="err" id="meal-err"></div>
       <button class="btn primary block">Save meal</button>
     </form>`, (sheet) => {
@@ -1120,7 +1439,7 @@ function openMealSheet(day) {
         const file = fileIn.files[0];
         if (file) {
           let blob;
-          try { blob = await resizeImage(file); } catch { throw new Error("Couldn't read that photo. Try a different one or save without it."); }
+          try { btn.textContent = 'Preparing photo…'; blob = await resizeImage(file); btn.textContent = 'Saving…'; } catch { throw new Error("Couldn't open that photo. Take a screenshot of it and upload the screenshot instead, or save without a photo."); }
           if (!blob) throw new Error("Couldn't read that photo. Try a different one or save without it.");
           photo_path = await api.uploadPhoto(blob);
         }
@@ -1147,6 +1466,10 @@ function renderMe() {
         <button class="btn block">Save profile</button>
       </form></div>
     ${phoneStepsCard()}
+    ${me.private_progress === undefined ? '' : `<div class="card"><h2>${tile('lock', 'purple')} Who sees my progress</h2>
+      <label class="row" style="gap:12px;align-items:flex-start;cursor:pointer"><input type="checkbox" id="priv-progress" ${me.private_progress ? 'checked' : ''} style="width:22px;height:22px;flex:none;margin-top:2px;accent-color:#ff2fa6">
+        <span><b>Keep my progress private</b><br><span class="small muted">The squad won't see your steps, walks, workouts, food or goal %. The leaderboard only shows your place, like "Leading", never your numbers.</span></span></label>
+    </div>`}
     <div class="card"><h2>${tile('lock', 'purple')} Private stats</h2>
       <div class="notice lock"><div>Only you can see this section. Friends only ever see your weight goal progress as a %.</div></div>
       ${g != null ? `<div style="margin-bottom:14px"><div class="row between"><b>Goal progress</b><b>${g}%</b></div><div class="bar"><i style="width:${g}%"></i></div>${lost != null ? `<div class="muted small" style="margin-top:6px">${lost >= 0 ? fmt1(lost) + ' lb lost' : fmt1(-lost) + ' lb gained'} · ${fmt1(Math.max(0, ps.weight_lb - ps.goal_weight_lb))} lb to go</div>` : ''}</div>` : ''}
@@ -1156,7 +1479,8 @@ function renderMe() {
     <div class="card">
       <button class="btn block" id="change-pic">${ic('camera', 16)} Change profile picture</button>
       ${me.avatar_url ? `<button class="btn ghost block" id="reset-pic">Use my original picture</button>` : ''}
-      ${me.is_admin ? `<button class="btn block" id="admin-reset">${ic('users', 16)} Reset someone's PIN</button>` : ''}
+      ${me.is_admin && mySquads ? `<button class="btn block" id="admin-squads">${ic('users', 16)} Squads & invites</button>` : ''}
+      ${me.is_admin ? `<button class="btn block" id="admin-reset">${ic('lock', 16)} Reset someone's PIN</button>` : ''}
       <button class="btn block" id="change-pin">${ic('lock', 16)} Change PIN</button>
       <button class="btn block danger" id="logout" style="margin-top:6px">${ic('logout', 16)} Log out</button>
       ${DEMO ? '<button class="btn block ghost" id="reset-demo">Reset test data</button>' : ''}
@@ -1169,17 +1493,23 @@ function renderMe() {
     const f = Object.fromEntries(new FormData(e.target));
     const name = f.display_name.trim().replace(/\s+/g, ' ');
     if (slugName(name).length < 2) { toast('Please use at least 2 letters'); return; }
-    const squadSlugs = (CFG.squadNames || ['Jill', 'Rush', 'Toni', 'Tiffy']).map(slugName).filter(x => x !== me.username);
+    const squadSlugs = [...new Set(Object.values(CFG.squads || { a: { names: CFG.squadNames || [] } }).flatMap(q => q.names || []))].map(slugName).filter(x => x !== me.username);
     if (squadSlugs.includes(slugName(name)) || profiles.some(p => p.id !== me.id && (slugName(p.display_name) === slugName(name) || p.username === slugName(name)))) { toast(`${name} belongs to someone else in the squad`); return; }
     await api.updateProfile({ display_name: name, color });
-    me = await api.me(); profiles = await api.listProfiles(); toast('Profile saved'); renderMe();
+    me = await api.me(); await loadPeople(); toast('Profile saved'); renderMe();
   };
   $('#edit-private').onclick = () => openPrivateSheet(false);
   $('#open-plan').onclick = openPlanSheet;
   $('#change-pin').onclick = openPinSheet;
   $('#change-pic').onclick = openPicUpload;
-  $('#reset-pic') && ($('#reset-pic').onclick = async () => { await api.updateProfile({ avatar_url: null }); me = await api.me(); profiles = await api.listProfiles(); toast('Back to your original picture'); renderMe(); });
+  $('#reset-pic') && ($('#reset-pic').onclick = async () => { await api.updateProfile({ avatar_url: null }); me = await api.me(); await loadPeople(); toast('Back to your original picture'); renderMe(); });
   $('#admin-reset') && ($('#admin-reset').onclick = openAdminReset);
+  $('#admin-squads') && ($('#admin-squads').onclick = openSquadsSheet);
+  if ($('#priv-progress')) $('#priv-progress').onchange = async (e) => {
+    const on = e.target.checked;
+    try { await api.updateProfile({ private_progress: on }); me = await api.me(); await loadPeople(); toast(on ? 'Your progress is now private 🔒' : 'Your squad can see your progress again'); }
+    catch (ex) { e.target.checked = !on; toast(/private_progress|column/i.test(ex.message) ? 'Run the private-progress update in Supabase first' : ex.message); }
+  };
   $('#hc-sync') && ($('#hc-sync').onclick = async () => { await syncHealthConnect(true); renderMe(); });
   $('#hc-settings') && ($('#hc-settings').onclick = () => nativeHealth()?.openHealthConnectSettings?.().catch(() => toast('Open Health Connect from your phone settings')));
   $('#clear-walks') && ($('#clear-walks').onclick = () => openSheet(`<h3>Clear my data</h3>
@@ -1252,7 +1582,7 @@ function openPicUpload() {
   openSheet(`<h3>Change profile picture</h3>
     <p class="small" style="margin-top:0">This shows on your home screen, your login tile and next to your name for the squad.</p>
     <div class="photo-drop" id="pp-drop">${ic('camera', 26)}<b>Choose a photo</b><small>Take one or pick from your gallery</small><img id="pp-prev" alt=""></div>
-    <input type="file" id="pp-file" accept="image/*" hidden>
+    <input type="file" id="pp-file" accept="image/*,.heic,.heif" hidden>
     <div class="err" id="pp-err"></div>
     <button class="btn primary block" id="pp-save" disabled>Save picture</button>`, (sh) => {
     const fileIn = $('#pp-file', sh), drop = $('#pp-drop', sh);
@@ -1264,15 +1594,41 @@ function openPicUpload() {
       try {
         const url = await api.uploadAvatar(await resizeImage(f, 900));
         await api.updateProfile({ avatar_url: url });
-        me = await api.me(); profiles = await api.listProfiles();
+        me = await api.me(); await loadPeople();
         closeSheet(); toast('Picture updated'); render();
       } catch (ex) { $('#pp-err', sh).textContent = ex.message; e.target.disabled = false; e.target.textContent = 'Save picture'; }
     };
   });
 }
 
+// Admin: rename squads and copy each squad's invite (its people never see the other squad)
+function openSquadsSheet() {
+  const site = location.origin + location.pathname.replace(/index\.html$/, '');
+  const invite = (q) => `Join our SquadFit squad (${q.name}) 💜\n\n1. Download the app: ${CFG.androidAppUrl || site}\n2. Open it and enter this squad code: ${q.code}\n3. Pick your name, make a 4-digit PIN, done!\n\nOn an iPhone or computer, just open: ${site}?join=${q.code}`;
+  const people = (id) => allProfiles.filter(p => squadMem?.some(m => m.squad_id === id && m.user_id === p.id)).map(p => esc(p.display_name)).join(', ') || 'No one yet';
+  openSheet(`<h3>Squads & invites</h3>
+    <p class="small muted" style="margin-top:0">Each squad only sees its own people (and you). You see both.</p>
+    ${mySquads.map(q => `<div class="card" style="margin-bottom:12px">
+      <label class="field"><span>Squad name</span><div class="row" style="gap:8px"><input data-name="${esc(q.id)}" value="${esc(q.name)}" maxlength="30"><button class="btn sm" data-save="${esc(q.id)}">Save</button></div></label>
+      <div class="small"><b>Code:</b> ${esc(q.code || '')}</div>
+      <div class="small muted" style="margin:4px 0 10px">${people(q.id)}</div>
+      <button class="btn primary block sm" data-copy="${esc(q.id)}">${ic('copy', 14)} Copy invite for WhatsApp</button>
+    </div>`).join('')}
+    <button class="btn ghost block" id="sq-done">Done</button>`, (sh) => {
+    $('#sq-done', sh).onclick = closeSheet;
+    $$('[data-save]', sh).forEach(b => b.onclick = async () => {
+      const v = $(`[data-name="${b.dataset.save}"]`, sh).value.trim();
+      try { await api.renameSquad(b.dataset.save, v); mySquads = await api.mySquads(); toast('Squad renamed'); } catch (e) { toast(e.message); }
+    });
+    $$('[data-copy]', sh).forEach(b => b.onclick = async () => {
+      const q = mySquads.find(x => x.id === b.dataset.copy), txt = invite(q);
+      try { await navigator.clipboard.writeText(txt); toast('Invite copied. Paste it in WhatsApp'); }
+      catch { if (navigator.share) navigator.share({ text: txt }).catch(() => {}); else prompt('Copy this invite:', txt); }
+    });
+  });
+}
 function openAdminReset() {
-  const others = profiles.filter(p => p.id !== me.id);
+  const others = allProfiles.filter(p => p.id !== me.id);
   openSheet(`<h3>Reset someone's PIN</h3>
     <p class="small" style="margin-top:0">Give them a temporary PIN. They log in with it, then change it in Me > Change PIN.</p>
     <label class="field"><span>Who?</span><select id="ar-who">${others.map(p => `<option value="${esc(p.username)}">${esc(p.display_name)}</option>`).join('')}</select></label>

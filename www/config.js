@@ -12,13 +12,20 @@ window.SQUADFIT_CONFIG = {
   stepGoal: 10000,
 
   // Download link for the Android app (filled in once it is built)
-  androidAppUrl: "",
+  androidAppUrl: "https://github.com/rushmills/squadfit-android/releases/latest/download/SquadFit.apk",
 
   // Squad admin (can reset PINs)
   adminName: "Rush",
 
-  // Names shown in the Register drop-down
+  // Names shown in the Register drop-down (Squad A)
   squadNames: ["Jill", "Rush", "Toni", "Tiffy"],
+
+  // Each squad's register names and login background. Squad B gets its own group picture
+  // once it's added (until then a plain purple background, so Squad A's photo never shows there).
+  squads: {
+    a: { names: ["Jill", "Rush", "Toni", "Tiffy"], backgroundImage: "assets/squad-bg.jpg" },
+    b: { names: ["Rush", "Ann", "Janice", "Lisa"], backgroundImage: "" }
+  },
 
   // Each person's own picture, matched to the name they join with
   // (capitals and spaces don't matter). Shown on their home screen and the login screen.

@@ -13,13 +13,22 @@
   <link rel="apple-touch-icon" href="icon-192.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&family=Kaushan+Script&display=swap" />
-  <link rel="stylesheet" href="styles.css?v=202611091314" />
+  <link rel="stylesheet" href="styles.css?v=202611180900" />
 </head>
 <body>
-  <div id="app"><div class="splash"><div class="splash-blur" style="background-image:url(assets/squad-bg.jpg)"></div><div class="splash-img" style="background-image:url(assets/squad-bg.jpg)"></div><div class="load"><i></i></div></div></div>
+  <div id="app"><div class="splash"><div class="splash-blur"></div><div class="splash-img"></div><div class="load"><i></i></div></div></div>
+  <script>
+    // Splash shows this phone's own squad picture (a new phone shows no group picture at all)
+    (function () { try {
+      var bg = localStorage.getItem('squadfit-splash');
+      if (!bg && localStorage.getItem('squadfit-logged-in-before') === '1' && !localStorage.getItem('squadfit-squad-code')) bg = 'assets/squad-bg.jpg';
+      if (bg && bg !== 'none') { var u = 'url(' + bg + ')'; document.querySelector('.splash-blur').style.backgroundImage = u; document.querySelector('.splash-img').style.backgroundImage = u; }
+      else document.querySelector('.splash').classList.add('plain');
+    } catch (e) { } })();
+  </script>
   <div id="sheet-root"></div>
   <div id="toast"></div>
-  <script src="config.js?v=202611091314"></script>
-  <script type="module" src="app.js?v=202611091314"></script>
+  <script src="config.js?v=202611180900"></script>
+  <script type="module" src="app.js?v=202611180900"></script>
 </body>
 </html>
