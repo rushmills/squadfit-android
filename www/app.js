@@ -4,7 +4,7 @@ import { ic, tile } from './icons.js';
 import { createStepCounter } from './steps.js';
 
 // ============ Version check: phones always get the newest app ============
-const APP_VERSION = '202611231000';
+const APP_VERSION = '202611231020';
 async function checkForUpdate() {
   try {
     const r = await fetch('version.txt?t=' + Date.now(), { cache: 'no-store' });
@@ -211,6 +211,11 @@ async function ensureChip() {
   const st = await chipStatus();
   if (!st?.available || st.running) return st;
   try { chipState = await nativePlugin('StepChip').start(); } catch { }
+  // First time on: ask Samsung not to put SquadFit to sleep, so counting never stops
+  if (chipOn() && chipState.batteryOk === false && !lsGet('squadfit-battery-asked')) {
+    lsSet('squadfit-battery-asked', '1');
+    try { await nativePlugin('StepChip').askBattery(); } catch { }
+  }
   return chipState;
 }
 const chipOn = () => !!(chipState?.available && chipState.permission && chipState.running);
@@ -245,12 +250,16 @@ async function syncHealthConnect(force) {
       if (!steps || day < weekAgo || day > today()) continue;
       if (await savePhoneSteps(day, steps, dist[day])) changed++;
     }
+    for (const [day, mins] of Object.entries(st?.minutes || {})) {
+      if (day < weekAgo || day > today()) continue;
+      try { if (await saveAutoSessions(day, autoSessions(mins))) changed++; } catch (e) { console.warn('auto walks', e); }
+    }
     if (chipOn() || Object.keys(perDay).length) { try { localStorage.setItem('squadfit-health-last', String(Date.now())); } catch { } }
     if (changed && document.querySelector('nav.tabs') && !document.querySelector('.sheet')) render();
   } catch (e) { console.warn('phone steps', e); }
 }
 // Keep today's steps fresh while the app is open, so the squad sees them as they happen
-setInterval(() => { if (document.visibilityState === 'visible' && me) syncHealthConnect(); }, 180000);
+setInterval(() => { if (document.visibilityState === 'visible' && me) syncHealthConnect(); }, 60000);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncHealthConnect(); });
 
 async function afterLogin() {
@@ -432,14 +441,18 @@ function streak(userId, acts, wos) {
   let n = 0; while (days.has(d)) { n++; d = addDays(d, -1); }
   return n;
 }
+const ALLDAY_FROM = '2026-11-23';   // the day all-day step counting started
 function dayTotals(userId, day, data) {
   const all = data.acts.filter(r => r.user_id === userId && r.day === day);
   const w = data.wos.filter(r => r.user_id === userId && r.day === day);
   const phone = all.filter(r => r.source === 'phone'), a = all.filter(r => r.source !== 'phone');
   const sum = (arr, k) => arr.reduce((s, r) => s + (+r[k] || 0), 0);
-  // The phone's own count already includes walks tracked in the app, so take whichever is bigger (never add both)
-  const steps = Math.max(sum(phone, 'steps'), sum(a, 'steps')), miles = Math.max(sum(phone, 'distance_mi'), sum(a, 'distance_mi'));
-  const moveCal = Math.max(sum(phone, 'calories'), sum(a, 'calories'));
+  // The phone's own count already includes walks it spotted (auto) or tracked in the app, so take whichever is bigger.
+  // From the all-day step chip onward, manual entries are steps done WITHOUT the phone (e.g. watch only), so they add on top.
+  const addManual = day >= ALLDAY_FROM, man = addManual ? a.filter(r => r.source === 'manual') : [], onPhone = addManual ? a.filter(r => r.source !== 'manual') : a;
+  const steps = Math.max(sum(phone, 'steps'), sum(onPhone, 'steps')) + sum(man, 'steps');
+  const miles = Math.max(sum(phone, 'distance_mi'), sum(onPhone, 'distance_mi')) + sum(man, 'distance_mi');
+  const moveCal = Math.max(sum(phone, 'calories'), sum(onPhone, 'calories')) + sum(man, 'calories');
   return {
     steps,
     miles,
@@ -605,7 +618,7 @@ async function renderToday() {
       ${ranked.map((p, i) => `<div class="lb">${rankBadge(i)}${avatar(p, 'sm')}<div class="grow">${esc(p.display_name)}</div>${hiddenFor(p) ? `<span class="small muted">${i === 0 && prOf(p.id)?.moved_week ? '👑 Leading · ' : ''}🔒 Private</span>` : `<b>${fmtInt(weekSteps(p.id))}</b>`}</div>`).join('')}
     </div>
   </div>`;
-  $('#q-live').onclick = () => openLive();
+  $('#q-live').onclick = () => { state.tab = 'track'; state.trackMode = 'move'; render(); };
   $('#q-workout').onclick = () => { state.tab = 'track'; state.trackMode = 'workout'; render(); };
   $('#q-meal').onclick = () => { state.viewUser = me.id; state.foodDay = t; state.tab = 'food'; render(); openMealSheet(t); };
   $('#q-water').onclick = async () => { await api.setWater(t, myWater + 1); toast(`${myWater + 1} glass${myWater ? 'es' : ''} of water today`); renderToday(); };
@@ -709,10 +722,10 @@ function workoutItem(w, canDelete, canCopy) {
 }
 function activityItem(a, canDelete) {
   const pace = a.distance_mi && a.duration_min ? paceStr(a.duration_min / a.distance_mi) + ' /mi' : null;
-  return `<div class="item"><div class="grow"><span class="tag move">${a.source === 'phone' ? 'Phone steps · full day' : (a.kind === 'run' ? 'Run' : 'Walk') + (a.source === 'live' ? ' · tracked' : '')}</span>
+  return `<div class="item"><div class="grow"><span class="tag move">${a.source === 'phone' ? 'All-day steps' : String(a.source || '').startsWith('auto') ? autoLabel(a) : (a.kind === 'run' ? 'Run' : 'Walk') + (a.source === 'live' ? ' · tracked' : a.source === 'manual' ? ' · added' : '')}</span>
     <div class="t">${a.steps ? fmtInt(a.steps) + ' steps' : ''}${a.steps && a.distance_mi ? ' · ' : ''}${a.distance_mi ? (+a.distance_mi < 10 ? (+a.distance_mi).toFixed(2) : fmt1(a.distance_mi)) + ' mi' : ''}</div>
     <div class="d">${[a.duration_min ? fmt1(a.duration_min) + ' min' : null, pace, a.calories ? '~' + a.calories + ' cal' : null].filter(Boolean).join(' · ')}</div>
-    ${canDelete && a.source !== 'phone' ? `<button class="btn sm ghost" style="padding:6px 0" data-addto="${a.id}">${ic('plus', 14)} Add steps from watch / elsewhere</button>` : ''}</div>
+    ${canDelete && a.source !== 'phone' && !String(a.source || '').startsWith('auto') ? `<button class="btn sm ghost" style="padding:6px 0" data-addto="${a.id}">${ic('plus', 14)} Add steps from watch / elsewhere</button>` : ''}</div>
     ${canDelete ? `<button class="x" data-del="activities:${a.id}">${ic('x', 16)}</button>` : ''}</div>`;
 }
 function mealItem(m, photo, canDelete) {
@@ -773,6 +786,49 @@ function renderTrack() {
   state.trackMode === 'move' ? renderMoveForm() : renderWorkoutForm();
 }
 
+// ---- Pace worked out automatically from steps per minute (no Start button) ----
+const AUTO_PACE = [[108, 'normal'], [122, 'brisk'], [142, 'fast'], [162, 'jog'], [Infinity, 'run']];
+const autoLabel = (a) => { const k = String(a.source).split(':')[1] || 'normal'; return `${paceOf(k).label} ${k === 'jog' || k === 'run' ? '' : 'walk'}`.trim() + ' · auto'; };
+// Group minutes with 60+ steps into walks (5+ minutes, short pauses allowed) and name the pace from the average steps a minute
+function autoSessions(mins) {
+  const m = Object.entries(mins || {}).map(([k, v]) => [+k, Math.round(+v || 0)]).filter(([, v]) => v >= 60 && v <= 220).sort((a, b) => a[0] - b[0]);
+  const out = []; let cur = null;
+  for (const [t, v] of m) {
+    if (cur && t - cur.end <= 3) { cur.end = t; cur.steps += v; cur.active++; }
+    else { if (cur) out.push(cur); cur = { start: t, end: t, steps: v, active: 1 }; }
+  }
+  if (cur) out.push(cur);
+  return out.filter(x => x.active >= 5).map(x => {
+    const spm = x.steps / x.active, pace = AUTO_PACE.find(([lim]) => spm < lim)[1], kind = pace === 'jog' || pace === 'run' ? 'run' : 'walk';
+    const duration_min = x.end - x.start + 1, distance_mi = +(x.steps * strideMiles(kind)).toFixed(2);
+    return { start: x.start, pace, kind, steps: x.steps, duration_min, distance_mi, calories: moveCalories({ kind, duration_min, distance_mi, steps: x.steps }) };
+  });
+}
+async function saveAutoSessions(day, sessions) {
+  const sig = JSON.stringify(sessions.map(x => [x.start, x.steps, x.pace]));
+  const key = `squadfit-auto-${me.id}-${day}`;
+  try { if (localStorage.getItem(key) === sig) return false; } catch { }
+  const old = (await api.list('activities', { userId: me.id, from: day, to: day })).filter(a => String(a.source || '').startsWith('auto'));
+  for (const a of old) await api.remove('activities', a.id);
+  for (const x of sessions) await api.insert('activities', { day, kind: x.kind, source: 'auto:' + x.pace, steps: x.steps, distance_mi: x.distance_mi, duration_min: x.duration_min, calories: x.calories });
+  try { localStorage.setItem(key, sig); } catch { }
+  return true;
+}
+const hhmm = (min) => new Date(2000, 0, 1, Math.floor(min / 60), min % 60).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+function autoStepsCard(todays) {
+  const phone = todays.find(a => a.source === 'phone');
+  const autos = todays.filter(a => String(a.source || '').startsWith('auto'));
+  const others = todays.filter(a => a.source !== 'phone' && !String(a.source || '').startsWith('auto'));
+  const sess = autoSessions(chipState?.minutes?.[today()]);
+  const isApp = !!nativePlugin('StepChip');
+  return `<div class="card"><h2>${tile('shoe', 'purple')} Today's steps</h2>
+    <div class="row between" style="margin-bottom:6px"><b style="font-size:26px">${fmtInt(phone?.steps || 0)}</b><span class="muted small">${chipOn() ? '✅ counting all day' : isApp ? 'not counting yet' : ''}</span></div>
+    <p class="muted small" style="margin-top:0">${chipOn() ? 'Counted automatically, no Start button. Walks of 5+ minutes show below with their pace. Car rides don\'t count.' : isApp ? 'Open the Me tab to turn on all-day steps.' : (CFG.androidAppUrl ? `Get the <a href="${esc(CFG.androidAppUrl)}" style="color:var(--accent)">Android app</a> to count steps automatically.` : '')}</p>
+    ${autos.length ? `<div>${autos.map((a) => { const x = sess.find(z => z.steps === a.steps); return activityItem(a, false).replace('<div class="grow">', `<div class="grow">${x ? `<div class="muted small">${hhmm(x.start)}</div>` : ''}`); }).join('')}</div>` : (chipOn() ? '<div class="muted small">No walks of 5+ minutes yet today.</div>' : '')}
+    ${others.length ? `<div style="margin-top:10px"><div class="muted small" style="margin-bottom:4px">Added by you</div><div id="today-acts">${others.map(a => activityItem(a, true)).join('')}</div></div>` : ''}
+    ${isApp ? `<button class="btn ghost block" id="auto-sync" style="margin-top:8px">${ic('activity', 16)} Update now</button>` : ''}
+  </div>`;
+}
 function todayWalksCard(todays) {
   return `<div class="card"><h2>${tile('shoe', 'purple')} Today's walks & runs</h2>
       <p class="muted small" style="margin-top:0">Keep going on a walk, or add steps you did on your watch or another app.</p>
@@ -784,12 +840,9 @@ async function renderMoveForm() {
   const t = today();
   const todays = (await api.list('activities', { userId: me.id, from: t, to: t }));
   $('#track-body').innerHTML = `
-    <div class="card"><h2>${tile('nav', 'purple')} Live tracking</h2>
-      <p class="muted small" style="margin-top:0">Pick your pace (Normal, Brisk, Fast, Jog or Run) and your steps never count lower than that pace, even with the screen locked. GPS tracks miles outdoors.</p>
-      <button class="btn green block" id="start-live">${ic('play', 16)} Start walk or run</button></div>
-    ${todays.length ? todayWalksCard(todays) : ''}
-    <div class="card"><h2>${tile('pencil', 'pink')} Enter manually</h2>
-      <p class="muted small" style="margin-top:0">Copy your totals from Samsung Health, or pick a pace and your minutes and we'll fill in the steps.</p>
+    ${autoStepsCard(todays)}
+    <div class="card"><h2>${tile('pencil', 'pink')} Add a walk without your phone</h2>
+      <p class="muted small" style="margin-top:0">Walked with just your watch, or left your phone behind? Add it here and it's added to your steps. Pick a pace and your minutes and we'll fill in the steps.</p>
       <form id="move-form">
         <div class="seg" id="kind-seg"><button type="button" data-k="walk" class="on">Walk</button><button type="button" data-k="run">Run</button></div>
         <label class="field"><span>Date</span><input type="date" name="day" value="${today()}" max="${today()}" required></label>
@@ -804,10 +857,9 @@ async function renderMoveForm() {
         <button class="btn primary block">Save</button>
       </form></div>`;
   $('#today-acts') && bindDeletes($('#today-acts'), renderMoveForm);
-  $$('[data-cont]').forEach(b => b.onclick = () => openLive({ continueAct: todays.find(a => a.id === b.dataset.cont) }));
+  $('#auto-sync') && ($('#auto-sync').onclick = async () => { await syncHealthConnect(true); renderMoveForm(); });
   let kind = 'walk';
   $$('#kind-seg button').forEach(b => b.onclick = () => { $$('#kind-seg button').forEach(x => x.classList.remove('on')); b.classList.add('on'); kind = b.dataset.k; });
-  $('#start-live').onclick = () => openLive();
   // Pick a pace + minutes and the steps (and miles) fill themselves in
   let mPace = null, autoSteps = null, autoMi = null;
   const mf = $('#move-form'), fSteps = mf.elements.steps, fMi = mf.elements.distance_mi, fMin = mf.elements.duration_min;
@@ -1596,6 +1648,7 @@ function renderMe() {
     else toast('SquadFit needs the Physical activity permission. Phone Settings > Apps > SquadFit > Permissions.');
     renderMe();
   });
+  $('#chip-battery') && ($('#chip-battery').onclick = async () => { try { await nativePlugin('StepChip').askBattery(); } catch { } setTimeout(async () => { await chipStatus(); renderMe(); }, 4000); });
   $('#chip-off') && ($('#chip-off').onclick = async () => { try { chipState = await nativePlugin('StepChip').stop(); } catch { } toast('All-day counting is off'); renderMe(); });
   $('#hc-settings') && ($('#hc-settings').onclick = () => nativeHealth()?.openHealthConnectSettings?.().catch(() => toast('Open Health Connect from your phone settings')));
   $('#clear-walks') && ($('#clear-walks').onclick = () => openSheet(`<h3>Clear my data</h3>
@@ -1652,10 +1705,11 @@ function phoneStepsCard() {
     return `<div class="card"><h2>${tile('shoe', 'green')} All-day steps</h2>
       ${on ? `<div class="notice" style="margin-bottom:10px">✅ SquadFit is counting your steps all day with your phone's step chip, even when the app is closed or the screen is locked. Car rides don't count.</div>
         <div class="row between" style="margin-bottom:12px"><b>Today</b><b>${fmtInt(chipState.today || 0)} steps</b></div>
-        <p class="muted small" style="margin-top:0">You'll see a quiet "steps today" note in your notifications. That's what keeps it counting.</p>
+        <p class="muted small" style="margin-top:0">You'll see a quiet "steps today" note in your notifications. That's what keeps it counting. It starts again by itself if your phone restarts.</p>
+        ${chipState.batteryOk === false ? `<div class="notice" style="margin-bottom:10px">Samsung may put SquadFit to sleep and stop the counting. Tap below, then choose <b>Allow</b>.</div><button class="btn block" id="chip-battery">Keep SquadFit counting (battery)</button>` : ''}
         <button class="btn primary block" id="hc-sync">${ic('activity', 16)} Update my steps now</button>
         <button class="btn ghost block" id="chip-off">Turn off all-day counting</button>`
-      : `<p class="small" style="margin-top:0">Let SquadFit count your steps all day by itself, even when the app is closed. No Start button, no other app needed.</p>
+      : `${chipState.error ? `<p class="small" style="color:var(--danger)">Couldn't start counting: ${esc(chipState.error).slice(0, 140)}</p>` : ''}<p class="small" style="margin-top:0">Let SquadFit count your steps all day by itself, even when the app is closed. No Start button, no other app needed.</p>
         ${chipState.permission === false ? `<p class="muted small">When your phone asks, choose <b>Allow</b> for Physical activity (and notifications).</p>` : ''}
         <button class="btn primary block" id="chip-on">${ic('shoe', 16)} Turn on all-day steps</button>`}
     </div>`;

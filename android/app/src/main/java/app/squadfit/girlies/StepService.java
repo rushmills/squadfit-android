@@ -55,6 +55,7 @@ public class StepService extends Service implements SensorEventListener {
     @Override
     public void onSensorChanged(SensorEvent event) {
         StepStore.onCounter(this, (long) event.values[0]);
+        ActivityWidget.updateAll(this, false);   // keep the home-screen widget live
         long now = System.currentTimeMillis();
         long today = StepStore.todaySteps(this);
         if (today != shownSteps && now - lastNotif > 30000) {   // refresh the notification at most every 30s

@@ -5,4 +5,5 @@
     <string name="package_name">app.squadfit.girlies</string>
     <string name="custom_url_scheme">app.squadfit.girlies</string>
     <string name="health_connect_privacy_policy_url">https://squadfitgirlies.netlify.app/privacy.html</string>
+    <string name="widget_description">Today's steps, active minutes and calories, live</string>
 </resources>

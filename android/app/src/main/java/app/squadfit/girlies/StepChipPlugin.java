@@ -72,7 +72,16 @@ public class StepChipPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void status(PluginCall call) { call.resolve(state()); }
+    public void status(PluginCall call) { ActivityWidget.updateAll(getContext(), false); call.resolve(state()); }
+
+    /** The step goal the widget's pink ring fills up to. */
+    @PluginMethod
+    public void setGoal(PluginCall call) {
+        int g = call.getInt("goal", 10000);
+        StepStore.prefs(getContext()).edit().putInt("goal", g > 0 ? g : 10000).apply();
+        ActivityWidget.updateAll(getContext(), true);
+        call.resolve(state());
+    }
 
     /** Switch on all-day counting (asks for the Physical activity permission the first time). */
     @PluginMethod
